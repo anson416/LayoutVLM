@@ -1,7 +1,7 @@
 """Content-variant generation for the VLM-unreliability audit harness.
 
 Given a scene directory containing a LayoutVLM input task JSON and its
-``layout.json``, this writes six sibling variant directories, each holding a
+``layout.json``, this writes sibling variant directories, each holding a
 modified ``layout.json`` (plus a copy of the task JSON):
 
   * Removal variants -- a seeded random subset of instances is *kept*:
@@ -14,11 +14,20 @@ modified ``layout.json`` (plus a copy of the task JSON):
       - ``variant_alt_0`` / ``variant_alt_2`` / ``variant_alt_4``
         (the suffix is the substitution rank offset; 0 = worst match).
 
-The removal logic is implemented as pure, importable functions and is fully
-unit-tested.  The worst-match hook lazily imports ``torch``/``transformers``
-*inside* the function and degrades gracefully (recording intent in the variant
-metadata, leaving the scene unchanged) when models or an asset library are
-unavailable, so the pipeline never crashes.
+  * Category-aware substitution variants -- worst-match constrained by
+    category:
+      - ``variant_subst_within`` (same category, different asset)
+      - ``variant_subst_cross``  (different category)
+
+  * Layout-scramble variant -- every instance is relocated to a random point
+    within the floor polygon, preserving the instance set, rotation and z:
+      - ``variant_scramble``
+
+The removal + scramble logic is implemented as pure, importable functions and
+is fully unit-tested.  The worst-match / category-substitution hooks lazily
+import ``torch``/``transformers`` *inside* the function and degrade gracefully
+(recording intent in the variant metadata, leaving the scene unchanged) when
+models or an asset library are unavailable, so the pipeline never crashes.
 """
 
 from __future__ import annotations
@@ -45,6 +54,17 @@ ALT_VARIANTS: List[Tuple[str, int]] = [
     ("variant_alt_2", 2),
     ("variant_alt_4", 4),
 ]
+
+# Category-aware worst-match substitution modes (dir name, mode).
+#   * ``within`` -- swap toward a *different* asset of the *same* category.
+#   * ``cross``  -- swap toward an asset of a *different* category.
+SUBST_VARIANTS: List[Tuple[str, str]] = [
+    ("variant_subst_within", "within"),
+    ("variant_subst_cross", "cross"),
+]
+
+# Layout-scramble content variant (relocates every instance within the floor).
+SCRAMBLE_VARIANT: str = "variant_scramble"
 
 
 # ===========================================================================
@@ -93,6 +113,96 @@ def make_removal_layout(
 
 
 # ===========================================================================
+# Layout-scramble logic (unit tested)
+# ===========================================================================
+
+
+def floor_bbox(
+    floor_vertices: List[List[float]],
+) -> Tuple[float, float, float, float]:
+    """Axis-aligned ``(min_x, min_y, max_x, max_y)`` of the floor polygon.
+
+    ``floor_vertices`` are CCW ``[x, y, z]`` points with ``z == 0`` (world up
+    is z).  Degenerate / empty inputs collapse to a zero-area box at the
+    origin.
+    """
+
+    if not floor_vertices:
+        return (0.0, 0.0, 0.0, 0.0)
+    xs = [float(v[0]) for v in floor_vertices]
+    ys = [float(v[1]) for v in floor_vertices]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _point_in_polygon(x: float, y: float, poly_xy: List[Tuple[float, float]]) -> bool:
+    """Ray-casting point-in-polygon test (boundary counts as inside-ish)."""
+
+    n = len(poly_xy)
+    if n < 3:
+        return False
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly_xy[i]
+        xj, yj = poly_xy[j]
+        if ((yi > y) != (yj > y)) and (
+            x < (xj - xi) * (y - yi) / ((yj - yi) or 1e-12) + xi
+        ):
+            inside = not inside
+        j = i
+    return inside
+
+
+def scramble_layout(
+    layout: Dict,
+    floor_vertices: List[List[float]],
+    seed: int,
+) -> Dict:
+    """Relocate every instance to a random ``(x, y)`` within the floor.
+
+    Pure + deterministic for a fixed ``seed``.  Each instance is moved to a
+    random point inside the floor polygon's bounding box (and, when a valid
+    polygon is available, rejection-sampled to land *inside* the polygon).
+    The instance set, ids, count, ``rotation`` and ``z`` are all preserved
+    (floor objects therefore keep their ``z = bbox.z / 2`` placement, which is
+    encoded in the original layout's z and left untouched here).
+
+    Instances are processed in sorted-id order so the result is independent of
+    the input dict ordering.
+    """
+
+    min_x, min_y, max_x, max_y = floor_bbox(floor_vertices)
+    poly_xy = [(float(v[0]), float(v[1])) for v in floor_vertices]
+    use_polygon = len(poly_xy) >= 3 and max_x > min_x and max_y > min_y
+
+    rng = random.Random(seed)
+    new_layout: Dict = {}
+    for inst_id in sorted(layout.keys()):
+        place = layout[inst_id]
+        pos = list(place.get("position", [0.0, 0.0, 0.0]))
+        while len(pos) < 3:
+            pos.append(0.0)
+        z = float(pos[2])
+
+        new_x = rng.uniform(min_x, max_x)
+        new_y = rng.uniform(min_y, max_y)
+        if use_polygon:
+            # Rejection-sample a handful of times to land inside the polygon;
+            # fall back to the bbox sample if the polygon is awkward.
+            for _ in range(32):
+                if _point_in_polygon(new_x, new_y, poly_xy):
+                    break
+                new_x = rng.uniform(min_x, max_x)
+                new_y = rng.uniform(min_y, max_y)
+
+        new_place = dict(place)
+        new_place["position"] = [new_x, new_y, z]
+        new_layout[inst_id] = new_place
+
+    return new_layout
+
+
+# ===========================================================================
 # Worst-match (structured retrieval) hook
 # ===========================================================================
 
@@ -110,47 +220,53 @@ def score_candidates_worst_match(
 ) -> Optional[int]:
     """Pick a *poorly* matching candidate index by text similarity.
 
-    Lazily imports ``torch``/``transformers`` and embeds the query + candidate
-    texts, ranking candidates by ascending similarity (worst first).  Returns
-    the index of the candidate at ``rank_offset`` in that ascending ranking, or
-    ``None`` if embeddings are unavailable (caller then degrades gracefully).
+    When ``VLMUNR_USE_EMBED_MODEL`` is truthy, lazily imports
+    ``torch``/``transformers`` and embeds the query + candidate texts, ranking
+    candidates by ascending similarity (worst first).  Returns the index of the
+    candidate at ``rank_offset`` in that ascending ranking, or ``None`` if
+    there are no candidates (caller then degrades gracefully).
 
-    Falls back to a pure-Python lexical (token-overlap) ranking when the ML
-    stack cannot be loaded, so the structure is still exercised offline.
+    By default (and whenever the ML stack cannot be loaded) it uses a
+    pure-Python lexical (token-overlap) ranking, so the structure is exercised
+    fully offline with no model download.
     """
 
     if not candidate_texts:
         return None
 
     sims: Optional[List[float]] = None
-    try:  # ML path -- only attempted, never required.
-        import torch  # noqa: F401  (lazy, optional)
-        from transformers import AutoModel, AutoTokenizer
+    # The embedding path is opt-in (it may download a model on first use).
+    # Default to the offline lexical fallback so the harness never reaches out
+    # to the network unless explicitly asked via VLMUNR_USE_EMBED_MODEL=1.
+    if os.environ.get("VLMUNR_USE_EMBED_MODEL", "").lower() in ("1", "true", "yes"):
+        try:  # ML path -- only attempted when opted in, never required.
+            import torch  # noqa: F401  (lazy, optional)
+            from transformers import AutoModel, AutoTokenizer
 
-        model_name = os.environ.get(
-            "VLMUNR_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
-        )
-        tok = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModel.from_pretrained(model_name)
-        model.eval()
-
-        def embed(texts: List[str]):
-            enc = tok(
-                texts, padding=True, truncation=True, return_tensors="pt"
+            model_name = os.environ.get(
+                "VLMUNR_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
             )
-            with torch.no_grad():
-                out = model(**enc)
-            # Mean-pool token embeddings.
-            mask = enc["attention_mask"].unsqueeze(-1).float()
-            summed = (out.last_hidden_state * mask).sum(1)
-            counts = mask.sum(1).clamp(min=1e-9)
-            return torch.nn.functional.normalize(summed / counts, dim=-1)
+            tok = AutoTokenizer.from_pretrained(model_name)
+            model = AutoModel.from_pretrained(model_name)
+            model.eval()
 
-        q = embed([query_text])
-        c = embed(candidate_texts)
-        sims = (c @ q.T).squeeze(-1).tolist()
-    except Exception:
-        sims = None
+            def embed(texts: List[str]):
+                enc = tok(
+                    texts, padding=True, truncation=True, return_tensors="pt"
+                )
+                with torch.no_grad():
+                    out = model(**enc)
+                # Mean-pool token embeddings.
+                mask = enc["attention_mask"].unsqueeze(-1).float()
+                summed = (out.last_hidden_state * mask).sum(1)
+                counts = mask.sum(1).clamp(min=1e-9)
+                return torch.nn.functional.normalize(summed / counts, dim=-1)
+
+            q = embed([query_text])
+            c = embed(candidate_texts)
+            sims = (c @ q.T).squeeze(-1).tolist()
+        except Exception:
+            sims = None
 
     if sims is None:
         # Lexical fallback: token-overlap similarity.
@@ -241,8 +357,110 @@ def make_worst_match_layout(
 
 
 # ===========================================================================
-# Driver
+# Category-aware substitution (within- vs cross-category)
 # ===========================================================================
+
+
+def make_category_subst_layout(
+    task: Dict,
+    layout: Dict,
+    mode: str,
+) -> Tuple[Dict, Dict]:
+    """Attempt a category-aware worst-match substitution.
+
+    ``mode`` is either ``"within"`` (swap toward a different asset of the
+    *same* category) or ``"cross"`` (swap toward an asset of a *different*
+    category).  Returns ``(new_layout, intent)``; placements are preserved
+    (asset identity lives in the task asset map) so ``new_layout`` mirrors
+    ``layout``.
+
+    The intent's ``substitutions`` is a list of ``{instance_id: mode}`` records
+    capturing what the hook decided per instance.  Like the rank-offset hook,
+    candidate assets come from a JSON library at ``VLMUNR_ASSET_LIBRARY``
+    (records of ``{"category","description","path"}``); when no library is
+    present the hook records intent for every instance and degrades gracefully,
+    leaving the scene unchanged.
+    """
+
+    if mode not in ("within", "cross"):
+        raise ValueError(f"Unknown subst mode: {mode!r}")
+
+    intent: Dict = {
+        "kind": "category_subst",
+        "mode": mode,
+        "substitutions": [],
+        "degraded": False,
+        "reason": "",
+    }
+
+    assets = task.get("assets", {})
+
+    lib_path = os.environ.get("VLMUNR_ASSET_LIBRARY")
+    candidates: List[Dict] = []
+    if lib_path and os.path.exists(lib_path):
+        try:
+            with open(lib_path) as f:
+                candidates = json.load(f)
+        except Exception as exc:  # pragma: no cover - defensive
+            intent["degraded"] = True
+            intent["reason"] = f"failed to read library: {exc}"
+            # Still record intent per instance so the probe is auditable.
+            for inst_id in layout:
+                if inst_id in assets:
+                    intent["substitutions"].append({inst_id: mode})
+            return dict(layout), intent
+
+    if not candidates:
+        intent["degraded"] = True
+        intent["reason"] = (
+            "no asset library available (set VLMUNR_ASSET_LIBRARY to enable "
+            f"category {mode}-substitution); intent recorded, scene unchanged"
+        )
+        for inst_id in layout:
+            if inst_id in assets:
+                intent["substitutions"].append({inst_id: mode})
+        return dict(layout), intent
+
+    # Library present: score candidates per instance, filtering by category.
+    for inst_id in layout:
+        asset = assets.get(inst_id)
+        if asset is None:
+            continue
+        src_cat = (asset.get("category", "") or "").strip().lower()
+        if mode == "within":
+            pool = [
+                (i, c)
+                for i, c in enumerate(candidates)
+                if (c.get("category", "") or "").strip().lower() == src_cat
+                and _text_for_asset(c) != _text_for_asset(asset)
+            ]
+        else:  # cross
+            pool = [
+                (i, c)
+                for i, c in enumerate(candidates)
+                if (c.get("category", "") or "").strip().lower() != src_cat
+            ]
+        if not pool:
+            # No eligible candidate for this mode -- record intent only.
+            intent["substitutions"].append({inst_id: mode})
+            continue
+        pool_texts = [_text_for_asset(c) for _, c in pool]
+        pick = score_candidates_worst_match(_text_for_asset(asset), pool_texts, 0)
+        if pick is None:
+            intent["substitutions"].append({inst_id: mode})
+            continue
+        chosen_idx, chosen = pool[pick]
+        intent["substitutions"].append(
+            {
+                "instance_id": inst_id,
+                "mode": mode,
+                "from": _text_for_asset(asset),
+                "to": pool_texts[pick],
+                "candidate_path": chosen.get("path"),
+            }
+        )
+
+    return dict(layout), intent
 
 
 def _resolve_inputs(scene_dir: str) -> Tuple[str, str]:
@@ -283,7 +501,12 @@ def _write_variant(
 
 
 def generate_variants(scene_dir: str, seed: int = 42) -> List[str]:
-    """Generate all six variant directories as siblings of ``scene_dir``."""
+    """Generate all variant directories as siblings of ``scene_dir``.
+
+    Writes removal (``half/quarter/eighth``), worst-match (``alt_0/2/4``),
+    category-aware substitution (``subst_within``/``subst_cross``) and a
+    ``scramble`` directory.
+    """
 
     task_path, task_name = _resolve_inputs(scene_dir)
     layout_path = os.path.join(scene_dir, "layout.json")
@@ -308,6 +531,23 @@ def generate_variants(scene_dir: str, seed: int = 42) -> List[str]:
                 parent, variant_dir, task, task_name, new_layout, intent
             )
         )
+
+    for variant_dir, mode in SUBST_VARIANTS:
+        new_layout, intent = make_category_subst_layout(task, layout, mode)
+        written.append(
+            _write_variant(
+                parent, variant_dir, task, task_name, new_layout, intent
+            )
+        )
+
+    # Layout-scramble: relocate every instance within the floor polygon.
+    floor_vertices = (
+        task.get("boundary", {}).get("floor_vertices", []) or []
+    )
+    scrambled = scramble_layout(layout, floor_vertices, seed)
+    written.append(
+        _write_variant(parent, SCRAMBLE_VARIANT, task, task_name, scrambled)
+    )
 
     return written
 

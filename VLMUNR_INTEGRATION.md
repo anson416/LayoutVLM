@@ -13,7 +13,7 @@ dependency on an external `vlmunr` package.
 | `vlmunr_hdri/` | The 8 environment maps (`city, courtyard, forest, interior, night, studio, sunrise, sunset` `.exr`) + `license.txt`. |
 | `vlmunr_config.py` | Fixed factor levels, baselines, and the `phase_levels(phase)` helper. No third-party imports. |
 | `vlmunr_render.py` | Joins `layout.json` to the input task JSON, builds the Blender scene honoring the LayoutVLM transform, sweeps a phase, writes PNGs. Pure functions for filenames/transform/join are bpy-free. |
-| `vlmunr_variants.py` | Generates 6 content-variant dirs: removal (`half/quarter/eighth`) + worst-match (`alt_0/2/4`). Removal logic is pure + unit-tested; worst-match is a lazy retrieval hook that degrades gracefully. |
+| `vlmunr_variants.py` | Generates content-variant dirs: removal (`half/quarter/eighth`), worst-match (`alt_0/2/4`), category-aware substitution (`subst_within`/`subst_cross`), and layout `scramble`. Removal + scramble logic is pure + unit-tested; substitution hooks degrade gracefully. |
 | `tests/test_vlmunr_integration.py` | pytest: filename exact-strings, removal/join logic, transform math, and a bpy smoke render. |
 | `tests/conftest.py` | Snapshots the real terminal fds so the bpy smoke test survives pytest capture. |
 | `gen.sh` | Driver: loop `benchmark_tasks/*/*.json` -> `python main.py ... --save_dir ...`. |
@@ -59,24 +59,33 @@ Examples: `render_512_50_0_0_city.png`,
 
 | Axis | Levels |
 |------|--------|
-| `RESOLUTIONS` | 224, 256, 384, 448, 512, 640, 768, 1024 |
-| `FOCAL_LENGTHS` | 24, 35, 50, 85, 100, 200 |
-| `BACKGROUND_GRAYS` | 0, 18, 65, 117, 128, 186, 204, 255 |
-| `HDRIS` | city, courtyard, forest, interior, night, studio, sunrise, sunset |
-| `PITCHES` | 0, 30, 60, 90 (0 == top-down in bpa convention) |
-| `YAWS` | 0, 30, ..., 330 |
+| `RESOLUTIONS` | 196, 224, 256, 336, 384, 448, 512, 768, 1024 (9) |
+| `FOCAL_LENGTHS` | 16, 24, 35, 50, 85, 100, 200 (7) |
+| `BACKGROUND_GRAYS` | 0, 65, 128, 186, 204, 255 (6) |
+| `BACKGROUND_CHROMATIC` | (255,0,0), (0,255,0), (0,0,255) (3) |
+| `FLOOR_TEXTURE_BACKGROUND` | `"floor_texture"` sentinel — documented for paper Table 1 parity, **NOT rendered** (no in-repo floor-texture compositing path) |
+| `HDRIS` | city, courtyard, forest, interior, night, studio, sunrise, sunset (8) |
+| `PITCHES` | 0, 15, 30, 45, 60, 75, 90 (7; 0 == top-down in bpa convention) |
+| `YAWS` | 0, 45, 90, 135, 180, 225, 270, 315 (8) |
 
 Baseline: `RES=512, FOCAL=50, BG=(128,128,128), HDRI=city, PITCH=0, YAW=0`.
+`BASELINE_YAW_PITCH=45` is the fixed pitch used when sweeping yaw.
 
-`phase_levels(phase)` varies exactly one axis (all others held at baseline):
+`phase_levels(phase)` returns a `Dict[str, List]` and varies exactly one axis
+(all others held at baseline):
 
 | Phase | Sweeps |
 |-------|--------|
 | `1a` | resolution |
 | `1b` | background gray |
+| `1b_chroma` | chromatic backgrounds (R/G/B) |
 | `1c` | HDRI (re-initializes Blender per HDRI) |
 | `1d` | focal length |
-| `2`  | camera pose = pitch x yaw |
+| `2`  | camera pose = pitch x yaw (kept for backward compat) |
+| `2_pitch` | pitch sweep at baseline yaw (0) |
+| `2_yaw` | yaw sweep at fixed pitch (45) |
+
+`PHASES` (== `ALL_PHASES`) = `["1a", "1b", "1b_chroma", "1c", "1d", "2", "2_pitch", "2_yaw"]`.
 
 ## Content variants (`vlmunr_variants.py`)
 
@@ -85,7 +94,14 @@ Sibling dirs of the scene dir, each with a variant `layout.json` + task copy:
 | Dir | Effect |
 |-----|--------|
 | `variant_half` / `variant_quarter` / `variant_eighth` | Keep `round(n/k)` instances (>= 1), seeded `random.Random(seed).sample` over **sorted** instance ids -> deterministic and order-independent. |
-| `variant_alt_0` / `variant_alt_2` / `variant_alt_4` | Worst-match asset substitution. Lazy hook embeds category/description text (transformers/torch, imported inside the function) and picks an ascending-similarity (worst-first) candidate at the given rank offset. Falls back to a pure-Python token-overlap ranking when the ML stack is unavailable. Writes `variant_intent.json`. |
+| `variant_alt_0` / `variant_alt_2` / `variant_alt_4` | Worst-match asset substitution at a rank offset. Lazy hook ranks candidates by ascending category/description text similarity (worst-first). The embedding path (transformers/torch) is **opt-in** via `VLMUNR_USE_EMBED_MODEL=1`; the default is a pure-Python token-overlap ranking (no model download). Writes `variant_intent.json`. |
+| `variant_subst_within` / `variant_subst_cross` | Category-aware worst-match: `within` swaps toward a different asset of the **same** category; `cross` swaps toward a **different** category. Same lazy scoring hook, constrained by category. With no `VLMUNR_ASSET_LIBRARY` present the hook degrades gracefully, recording per-instance intent `{instance_id: mode}` in `variant_intent.json` and leaving the scene unchanged. |
+| `variant_scramble` | Relocate **every** instance to a random `(x, y)` within the floor polygon (rejection-sampled inside the polygon, else within its bbox). Pure deterministic function of `(layout_dict, floor_vertices, seed)`; preserves the instance set/ids/count and each instance's `rotation` and `z` (floor objects keep `z = bbox.z/2`). |
+
+Worst-match / substitution candidates come from a JSON library at
+`VLMUNR_ASSET_LIBRARY` (records of `{"category","description","path"}`). When
+absent, the substitution hooks no-op-record intent (graceful degradation) so
+the pipeline never crashes — LayoutVLM ships no in-repo retrieval index.
 
 ## LayoutVLM coordinate convention (honored by the renderer)
 
@@ -108,17 +124,23 @@ Sibling dirs of the scene dir, each with a variant `layout.json` + task copy:
 **Verified (this environment, conda env `vlmunr`, bpy 5.1.2 + torch):**
 
 - `ast.parse` syntax check passes on all new `.py` files.
-- `pytest tests/ -x -q` -> **20 passed** (filename exact-strings, phase-level
-  shapes, render-count enumeration, removal-fraction + clamp + determinism +
-  order-independence, layout/asset join incl. orphan drop, transform math
-  incl. -90 pre-rotation and floor `z = bbox.z/2`, and a headless bpy smoke
-  render of a primitive cube producing a non-empty PNG + composite).
+- `pytest tests/ -q` -> **34 passed** (filename exact-strings, phase-level
+  shapes, paper Table 1 factor-level counts + exact values, the `1b_chroma`
+  chromatic phase, `2_pitch` at yaw 0 and `2_yaw` at pitch 45, render-count
+  enumeration, removal-fraction + clamp + determinism + order-independence,
+  layout/asset join incl. orphan drop, layout-scramble determinism + in-bounds
+  + preserved ids/rotation/z + order-independence, within-/cross-category
+  substitution intent recording + graceful degradation + a library-backed
+  scoring path, transform math incl. -90 pre-rotation and floor `z = bbox.z/2`,
+  and a headless bpy smoke render of a primitive cube producing a non-empty
+  PNG + composite).
 - Standalone headless render through `vlmunr_bpa` (initialize with `city.exr`
   -> cube -> `render_perspective` -> `add_bg_to_rgba`) writes non-empty master
   and composite PNGs.
-- Variant generator produces the 6 sibling dirs with correct kept-counts and
-  graceful worst-match degradation (recorded intent, scene unchanged) when no
-  asset library is configured; the worst-match scorer ranks an unrelated
+- Variant generator produces the sibling dirs with correct kept-counts,
+  graceful worst-match / category-substitution degradation (recorded intent
+  `{instance_id: mode}`, scene unchanged) when no asset library is configured,
+  and a layout-scramble dir; the worst-match scorer ranks an unrelated
   candidate as worst via the offline lexical fallback (no model downloaded).
 
 **NOT validated (requires assets / services not present here):**

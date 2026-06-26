@@ -12,6 +12,7 @@ Covers:
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 
@@ -105,6 +106,76 @@ def test_phase_levels_shapes():
         cfg.phase_levels("bogus")
 
 
+# ===========================================================================
+# Factor-level counts -> paper Table 1 parity
+# ===========================================================================
+
+
+def test_factor_level_counts():
+    assert len(cfg.RESOLUTIONS) == 9
+    assert len(cfg.FOCAL_LENGTHS) == 7
+    assert len(cfg.PITCHES) == 7
+    assert len(cfg.YAWS) == 8
+    assert len(cfg.BACKGROUND_GRAYS) == 6
+    assert len(cfg.BACKGROUND_CHROMATIC) == 3
+
+
+def test_factor_level_values_exact():
+    assert cfg.RESOLUTIONS == [196, 224, 256, 336, 384, 448, 512, 768, 1024]
+    assert cfg.FOCAL_LENGTHS == [16, 24, 35, 50, 85, 100, 200]
+    assert cfg.PITCHES == [0, 15, 30, 45, 60, 75, 90]
+    assert cfg.YAWS == [0, 45, 90, 135, 180, 225, 270, 315]
+    assert cfg.BACKGROUND_GRAYS == [0, 65, 128, 186, 204, 255]
+    assert cfg.BACKGROUND_CHROMATIC == [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
+    assert cfg.FLOOR_TEXTURE_BACKGROUND == "floor_texture"
+    assert cfg.BASELINE_YAW_PITCH == 45
+
+
+def test_phase_1b_chroma():
+    p = cfg.phase_levels("1b_chroma")
+    assert p["bg"] == cfg.BACKGROUND_CHROMATIC
+    assert len(p["bg"]) == 3
+    # all other axes at baseline
+    assert p["res"] == [cfg.BASELINE_RES]
+    specs = render.enumerate_renders("1b_chroma")
+    assert len(specs) == 1
+    assert specs[0]["bgs"] == [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
+
+
+def test_phase_2_pitch():
+    p = cfg.phase_levels("2_pitch")
+    assert p["pitch"] == cfg.PITCHES
+    assert len(p["pitch"]) == 7
+    assert p["yaw"] == [0]  # baseline yaw
+    specs = render.enumerate_renders("2_pitch")
+    assert len(specs) == 7
+    assert all(s["yaw"] == 0 for s in specs)
+
+
+def test_phase_2_yaw():
+    p = cfg.phase_levels("2_yaw")
+    assert p["yaw"] == cfg.YAWS
+    assert len(p["yaw"]) == 8
+    assert p["pitch"] == [45]  # fixed pitch
+    specs = render.enumerate_renders("2_yaw")
+    assert len(specs) == 8
+    assert all(s["pitch"] == 45 for s in specs)
+
+
+def test_phases_list_extended():
+    assert cfg.PHASES == [
+        "1a",
+        "1b",
+        "1b_chroma",
+        "1c",
+        "1d",
+        "2",
+        "2_pitch",
+        "2_yaw",
+    ]
+    assert cfg.ALL_PHASES == cfg.PHASES
+
+
 def test_enumerate_renders_counts():
     # phase 1a: one master per resolution, each with one (baseline) bg.
     specs = render.enumerate_renders("1a")
@@ -185,6 +256,129 @@ def test_join_layout_to_assets():
     assert rec["bbox"]["z"] == 0.4
     assert rec["rotation_z_deg"] == 0.0
     assert records[1]["rotation_z_deg"] == 10.0
+
+
+# ===========================================================================
+# (b2) Layout scramble + category-aware substitution
+# ===========================================================================
+
+
+def test_floor_bbox():
+    verts = [[0, 0, 0], [4, 0, 0], [4, 5, 0], [0, 5, 0]]
+    assert variants.floor_bbox(verts) == (0.0, 0.0, 4.0, 5.0)
+    assert variants.floor_bbox([]) == (0.0, 0.0, 0.0, 0.0)
+
+
+def test_scramble_determinism_bounds_and_preserved_ids():
+    layout = make_synthetic_layout(8)
+    verts = [[0, 0, 0], [4, 0, 0], [4, 5, 0], [0, 5, 0]]
+    out = variants.scramble_layout(layout, verts, seed=123)
+    # determinism
+    assert out == variants.scramble_layout(layout, verts, seed=123)
+    # preserved instance set + count
+    assert set(out.keys()) == set(layout.keys())
+    assert len(out) == len(layout)
+    min_x, min_y, max_x, max_y = variants.floor_bbox(verts)
+    for inst_id, place in out.items():
+        x, y, z = place["position"]
+        # in-bounds (x, y) within floor bbox
+        assert min_x <= x <= max_x
+        assert min_y <= y <= max_y
+        # rotation + z unchanged
+        assert place["rotation"] == layout[inst_id]["rotation"]
+        assert z == layout[inst_id]["position"][2]
+
+
+def test_scramble_different_seed_moves_points():
+    layout = make_synthetic_layout(8)
+    verts = [[0, 0, 0], [4, 0, 0], [4, 5, 0], [0, 5, 0]]
+    a = variants.scramble_layout(layout, verts, seed=1)
+    b = variants.scramble_layout(layout, verts, seed=2)
+    assert any(a[i]["position"][:2] != b[i]["position"][:2] for i in a)
+
+
+def test_scramble_order_independent():
+    layout = make_synthetic_layout(6)
+    rev = {k: layout[k] for k in reversed(list(layout.keys()))}
+    verts = [[0, 0, 0], [4, 0, 0], [4, 5, 0], [0, 5, 0]]
+    fwd = variants.scramble_layout(layout, verts, seed=9)
+    bwd = variants.scramble_layout(rev, verts, seed=9)
+    for i in fwd:
+        assert fwd[i]["position"] == bwd[i]["position"]
+
+
+def test_subst_within_intent_recording_degraded(monkeypatch):
+    monkeypatch.delenv("VLMUNR_ASSET_LIBRARY", raising=False)
+    task = make_synthetic_task(4)
+    layout = make_synthetic_layout(4)
+    new_layout, intent = variants.make_category_subst_layout(
+        task, layout, "within"
+    )
+    # scene unchanged
+    assert new_layout == layout
+    assert intent["kind"] == "category_subst"
+    assert intent["mode"] == "within"
+    assert intent["degraded"] is True
+    # intent recorded as {instance_id: mode} per joined instance
+    assert len(intent["substitutions"]) == 4
+    for rec in intent["substitutions"]:
+        assert list(rec.values())[0] == "within"
+        assert list(rec.keys())[0] in layout
+
+
+def test_subst_cross_intent_recording_degraded(monkeypatch):
+    monkeypatch.delenv("VLMUNR_ASSET_LIBRARY", raising=False)
+    task = make_synthetic_task(3)
+    layout = make_synthetic_layout(3)
+    new_layout, intent = variants.make_category_subst_layout(
+        task, layout, "cross"
+    )
+    assert new_layout == layout
+    assert intent["mode"] == "cross"
+    assert intent["degraded"] is True
+    assert len(intent["substitutions"]) == 3
+    for rec in intent["substitutions"]:
+        assert list(rec.values())[0] == "cross"
+
+
+def test_subst_invalid_mode_raises():
+    task = make_synthetic_task(2)
+    layout = make_synthetic_layout(2)
+    with pytest.raises(ValueError):
+        variants.make_category_subst_layout(task, layout, "bogus")
+
+
+def test_subst_with_library_within_and_cross(tmp_path, monkeypatch):
+    # Build a tiny library so the scoring/category-filter path executes.
+    lib = [
+        {"category": "cat0", "description": "another cat0 thing", "path": "/a.glb"},
+        {"category": "cat1", "description": "a cat1 thing", "path": "/b.glb"},
+        {"category": "catX", "description": "totally different", "path": "/c.glb"},
+    ]
+    lib_path = tmp_path / "lib.json"
+    lib_path.write_text(json.dumps(lib))
+    monkeypatch.setenv("VLMUNR_ASSET_LIBRARY", str(lib_path))
+
+    task = make_synthetic_task(2)  # instances are cat0, cat1
+    layout = make_synthetic_layout(2)
+
+    _, within = variants.make_category_subst_layout(task, layout, "within")
+    assert within["degraded"] is False
+    # uid00-0 is cat0: a within-category candidate (cat0) exists.
+    within_for_0 = [
+        s for s in within["substitutions"]
+        if s.get("instance_id") == "uid00-0"
+    ]
+    assert within_for_0 and within_for_0[0]["mode"] == "within"
+
+    _, cross = variants.make_category_subst_layout(task, layout, "cross")
+    assert cross["degraded"] is False
+    cross_for_0 = [
+        s for s in cross["substitutions"]
+        if s.get("instance_id") == "uid00-0"
+    ]
+    # a cross-category candidate (not cat0) must have been chosen
+    assert cross_for_0 and cross_for_0[0]["mode"] == "cross"
 
 
 # ===========================================================================

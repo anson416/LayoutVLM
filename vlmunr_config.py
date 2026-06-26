@@ -14,9 +14,23 @@ from typing import Dict, List, Tuple
 # Factor levels
 # ---------------------------------------------------------------------------
 
-RESOLUTIONS: List[int] = [224, 256, 384, 448, 512, 640, 768, 1024]
-FOCAL_LENGTHS: List[int] = [24, 35, 50, 85, 100, 200]
-BACKGROUND_GRAYS: List[int] = [0, 18, 65, 117, 128, 186, 204, 255]
+RESOLUTIONS: List[int] = [196, 224, 256, 336, 384, 448, 512, 768, 1024]
+FOCAL_LENGTHS: List[int] = [16, 24, 35, 50, 85, 100, 200]
+BACKGROUND_GRAYS: List[int] = [0, 65, 128, 186, 204, 255]
+
+# Saturated chromatic backgrounds (pure R / G / B), composited like the grays.
+BACKGROUND_CHROMATIC: List[Tuple[int, int, int]] = [
+    (255, 0, 0),
+    (0, 255, 0),
+    (0, 0, 255),
+]
+
+# Sentinel for a floor-texture background condition.  Documented for paper
+# parity (Table 1) but NOT rendered by this harness -- there is no in-repo
+# floor-texture compositing path, so it is intentionally excluded from the
+# composited background sweeps below.
+FLOOR_TEXTURE_BACKGROUND: str = "floor_texture"
+
 HDRIS: List[str] = [
     "city",
     "courtyard",
@@ -27,8 +41,8 @@ HDRIS: List[str] = [
     "sunrise",
     "sunset",
 ]
-PITCHES: List[int] = [0, 30, 60, 90]  # 0 == top-down in bpa convention
-YAWS: List[int] = list(range(0, 360, 30))  # 0, 30, ..., 330
+PITCHES: List[int] = [0, 15, 30, 45, 60, 75, 90]  # 0 == top-down in bpa convention
+YAWS: List[int] = [0, 45, 90, 135, 180, 225, 270, 315]
 
 # ---------------------------------------------------------------------------
 # Baseline configuration (the "default" point in factor space)
@@ -40,6 +54,9 @@ BASELINE_BG: Tuple[int, int, int] = (128, 128, 128)
 BASELINE_HDRI: str = "city"
 BASELINE_PITCH: int = 0
 BASELINE_YAW: int = 0
+# Fixed pitch used when sweeping yaw (and the baseline yaw used when sweeping
+# pitch is ``BASELINE_YAW`` above).
+BASELINE_YAW_PITCH: int = 45
 
 
 def gray(level: int) -> Tuple[int, int, int]:
@@ -54,9 +71,10 @@ def phase_levels(phase: str) -> Dict[str, List]:
     Each phase varies exactly one axis (or, for phase ``2``, the pitch x yaw
     cross-product) while holding every other factor at its baseline value.
 
-    Returns a dict with the keys ``res``, ``focal``, ``bg`` (list of gray
-    levels), ``hdri``, ``pitch`` and ``yaw``.  The varied axis contains all of
-    its levels; the remaining axes contain a single baseline value.
+    Returns a dict with the keys ``res``, ``focal``, ``bg`` (list of either
+    gray levels as ints *or* full ``(r, g, b)`` tuples for chromatic phases),
+    ``hdri``, ``pitch`` and ``yaw``.  The varied axis contains all of its
+    levels; the remaining axes contain a single baseline value.
     """
 
     base = {
@@ -72,6 +90,8 @@ def phase_levels(phase: str) -> Dict[str, List]:
         base["res"] = list(RESOLUTIONS)
     elif phase == "1b":  # background gray sweep
         base["bg"] = list(BACKGROUND_GRAYS)
+    elif phase == "1b_chroma":  # chromatic background sweep
+        base["bg"] = list(BACKGROUND_CHROMATIC)
     elif phase == "1c":  # HDRI sweep
         base["hdri"] = list(HDRIS)
     elif phase == "1d":  # focal length sweep
@@ -79,10 +99,19 @@ def phase_levels(phase: str) -> Dict[str, List]:
     elif phase == "2":  # camera pose sweep (pitch x yaw)
         base["pitch"] = list(PITCHES)
         base["yaw"] = list(YAWS)
+    elif phase == "2_pitch":  # pitch sweep at baseline yaw (0)
+        base["pitch"] = list(PITCHES)
+        base["yaw"] = [BASELINE_YAW]
+    elif phase == "2_yaw":  # yaw sweep at fixed pitch (45)
+        base["pitch"] = [BASELINE_YAW_PITCH]
+        base["yaw"] = list(YAWS)
     else:
         raise ValueError(f"Unknown phase: {phase!r}")
 
     return base
 
 
-PHASES: List[str] = ["1a", "1b", "1c", "1d", "2"]
+PHASES: List[str] = ["1a", "1b", "1b_chroma", "1c", "1d", "2", "2_pitch", "2_yaw"]
+
+# Backwards-compatible alias for the full phase list.
+ALL_PHASES: List[str] = list(PHASES)

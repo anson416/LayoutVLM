@@ -228,12 +228,26 @@ def compute_scene_center_radius(
     return (cx, cy, cz), radius
 
 
+def _as_rgb(bg) -> Tuple[int, int, int]:
+    """Normalize a background level to an ``(r, g, b)`` tuple.
+
+    Gray phases store a single int per level; chromatic phases store full
+    ``(r, g, b)`` tuples.  Accept either shape.
+    """
+
+    if isinstance(bg, (tuple, list)):
+        r, g, b = bg
+        return (int(r), int(g), int(b))
+    return (int(bg), int(bg), int(bg))
+
+
 def enumerate_renders(phase: str) -> List[Dict]:
     """Expand a phase into a list of render specs (pure, no bpy).
 
     Each spec is a dict with ``res, focal, pitch, yaw, hdri`` and a list of
-    background gray tuples ``bgs``.  One spec == one master render plus its
-    composites.
+    background ``(r, g, b)`` tuples ``bgs`` (gray levels are expanded to equal
+    channels; chromatic phases pass their tuples through).  One spec == one
+    master render plus its composites.
     """
 
     levels = cfg.phase_levels(phase)
@@ -243,7 +257,7 @@ def enumerate_renders(phase: str) -> List[Dict]:
             for focal in levels["focal"]:
                 for pitch in levels["pitch"]:
                     for yaw in levels["yaw"]:
-                        bgs = [(g, g, g) for g in levels["bg"]]
+                        bgs = [_as_rgb(g) for g in levels["bg"]]
                         specs.append(
                             {
                                 "res": res,
@@ -389,7 +403,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--phase",
-        choices=["1a", "1b", "1c", "1d", "2", "all"],
+        choices=cfg.PHASES + ["all"],
         default="1a",
     )
     p.add_argument("--env-strength", type=float, default=1.0)
