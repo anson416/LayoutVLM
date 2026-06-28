@@ -73,11 +73,11 @@ def prepare_task_assets(task, asset_dir):
                 "category": data["annotations"]["category"],
                 'description': data['annotations']['description'],
                 'path': data['path'],
-                'onCeiling': data['annotations']['onCeiling'],
-                'onFloor': data['annotations']['onFloor'],
-                'onWall': data['annotations']['onWall'],
-                'onObject': data['annotations']['onObject'],
-                'frontView': data['annotations']['frontView'],
+                'onCeiling': data['annotations'].get('onCeiling', False),
+                'onFloor': data['annotations'].get('onFloor', True),
+                'onWall': data['annotations'].get('onWall', False),
+                'onObject': data['annotations'].get('onObject', False),
+                'frontView': data['annotations'].get('frontView', 0),
                 'assetMetadata': {
                     "boundingBox": {
                         "x": float(data['assetMetadata']['boundingBox']['y']),  # SWAP x and y
