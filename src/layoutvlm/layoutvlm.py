@@ -26,9 +26,22 @@ from utils.placement_utils import replace_z_rot_degree_to_rpy_radians
 
 
 def extract_python_program(input_text):
-    pattern = r"```python\n(.*?)```"
-    matches = re.findall(pattern, input_text, flags=re.DOTALL)
-    return matches
+    # Accept ```python, ```py, or bare ``` fences, with optional whitespace.
+    for pattern in (r"```(?:python|py)\s*\n(.*?)```", r"```\s*\n(.*?)```"):
+        matches = re.findall(pattern, input_text, flags=re.DOTALL)
+        if matches:
+            return [m.strip() for m in matches]
+    return []
+
+
+def _strip_code_fences(text):
+    """Remove stray leading/trailing markdown fence lines from code text."""
+    lines = text.splitlines()
+    while lines and lines[0].strip().startswith("```"):
+        lines = lines[1:]
+    while lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines)
 
 def extract_description_program(input_text):
     pattern = r"\*\*\*(.*?)\*\*\*"
@@ -219,7 +232,8 @@ class LayoutVLM:
         if matches:
             constraint_program = matches[0]
         else:
-            constraint_program = response_text
+            # No clean fenced block; strip any stray fence lines from the raw text.
+            constraint_program = _strip_code_fences(response_text)
 
         ### remove re-initialized variables
         matches = list(re.finditer(r"\w+ = Assets\(", constraint_program))
