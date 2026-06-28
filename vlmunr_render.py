@@ -116,42 +116,56 @@ def _find_task_json(scene_dir: str) -> str:
 
 
 def join_layout_to_assets(
-    task: Dict, layout: Dict
+    task: Dict, layout: Dict, asset_dir: str = None
 ) -> List[Dict]:
     """Join ``layout.json`` placements back to task asset metadata.
 
-    Returns a list of placement records, one per instance present in *both*
-    the layout and the task asset map, each with::
-
-        {
-          "id": str,
-          "path": str,
-          "position": [x, y, z],
-          "rotation_z_deg": float,
-          "bbox": {"x":.., "y":.., "z":..},
-          "onFloor": bool,
-          "category": str,
-          "description": str,
-        }
-
-    Instances present in the layout but missing from the asset map (or lacking a
-    usable path) are skipped.
+    Raw benchmark tasks carry empty asset entries (all metadata is filled at
+    generation time by prepare_task_assets and not saved). When ``asset_dir`` is
+    given, resolve each instance's glb path and bounding box from
+    ``<asset_dir>/<uid>/{<uid>.glb,data.json}`` (uid = inst_id without the
+    trailing ``-<idx>``). Instances with no resolvable path are skipped.
     """
+
+    import json as _json
 
     assets = task.get("assets", {})
     records: List[Dict] = []
     for inst_id, place in layout.items():
         asset = assets.get(inst_id)
         if asset is None:
-            continue
+            asset = {}
         path = asset.get("path")
-        position = list(place.get("position", [0, 0, 0]))
-        rotation = list(place.get("rotation", [0, 0, 0]))
         bbox = (
             asset.get("assetMetadata", {}).get("boundingBox")
             or asset.get("boundingBox")
             or {}
         )
+        onFloor = bool(asset.get("onFloor", False))
+        category = asset.get("category", "")
+        description = asset.get("description", "")
+        # Resolve from the asset_dir when the task entry is empty.
+        if (not path or not bbox) and asset_dir:
+            uid = inst_id.rsplit("-", 1)[0]
+            adir = os.path.join(asset_dir, uid)
+            cand = os.path.join(adir, f"{uid}.glb")
+            if os.path.exists(cand):
+                path = path or cand
+            dj = os.path.join(adir, "data.json")
+            if os.path.exists(dj):
+                try:
+                    d = _json.load(open(dj))
+                    ann = d.get("annotations", {})
+                    bbox = bbox or d.get("assetMetadata", {}).get("boundingBox", {})
+                    onFloor = bool(ann.get("onFloor", onFloor))
+                    category = category or ann.get("category", "")
+                    description = description or ann.get("description", "")
+                except Exception:
+                    pass
+        if not path or not os.path.exists(path):
+            continue
+        position = list(place.get("position", [0, 0, 0]))
+        rotation = list(place.get("rotation", [0, 0, 0]))
         records.append(
             {
                 "id": inst_id,
@@ -159,9 +173,9 @@ def join_layout_to_assets(
                 "position": position,
                 "rotation_z_deg": float(rotation[-1]) if rotation else 0.0,
                 "bbox": bbox,
-                "onFloor": bool(asset.get("onFloor", False)),
-                "category": asset.get("category", ""),
-                "description": asset.get("description", ""),
+                "onFloor": onFloor,
+                "category": category,
+                "description": description,
             }
         )
     return records
@@ -276,7 +290,7 @@ def enumerate_renders(phase: str) -> List[Dict]:
 # ===========================================================================
 
 
-def load_scene_into_blender(task: Dict, layout: Dict):
+def load_scene_into_blender(task: Dict, layout: Dict, asset_dir: str = None):
     """Import every joined placement into the current Blender scene.
 
     Requires ``bpy`` (imported lazily via ``vlmunr_bpa``).  Clears the scene
@@ -287,7 +301,7 @@ def load_scene_into_blender(task: Dict, layout: Dict):
     import vlmunr_bpa as bpa
 
     bpa.clear()
-    records = join_layout_to_assets(task, layout)
+    records = join_layout_to_assets(task, layout, asset_dir)
     imported: List[Dict] = []
     for rec in records:
         path = rec.get("path")
@@ -319,6 +333,7 @@ def render_phase(
     phase: str,
     *,
     env_strength: float = 1.0,
+    asset_dir: str = None,
 ) -> List[str]:
     """Render every spec in *phase*, returning the list of PNG paths written."""
 
@@ -342,7 +357,7 @@ def render_phase(
         if not os.path.exists(env):
             raise FileNotFoundError(f"HDRI not found: {env}")
         bpa.initialize(transparent=True, environment_map=(env, env_strength))
-        load_scene_into_blender(task, layout)
+        load_scene_into_blender(task, layout, asset_dir)
         current_hdri = hdri
         scene_loaded = True
 
@@ -407,6 +422,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default="1a",
     )
     p.add_argument("--env-strength", type=float, default=1.0)
+    p.add_argument(
+        "--asset-dir",
+        default="objaverse_processed",
+        help="Asset dir to resolve <uid>/<uid>.glb + data.json when the task "
+        "JSON has empty asset entries (raw benchmark tasks).",
+    )
     return p.parse_args(argv)
 
 
@@ -420,12 +441,22 @@ def main(argv: Optional[List[str]] = None) -> None:
     with open(layout_path) as f:
         layout = json.load(f)
 
+    asset_dir = args.asset_dir
+    if asset_dir and not os.path.isabs(asset_dir):
+        # resolve relative to CWD, then to the repo dir
+        if not os.path.isdir(asset_dir):
+            here = os.path.dirname(os.path.abspath(__file__))
+            cand = os.path.join(here, asset_dir)
+            if os.path.isdir(cand):
+                asset_dir = cand
+
     phases = cfg.PHASES if args.phase == "all" else [args.phase]
     all_written: List[str] = []
     for ph in phases:
         all_written.extend(
             render_phase(
-                task, layout, scene_dir, ph, env_strength=args.env_strength
+                task, layout, scene_dir, ph,
+                env_strength=args.env_strength, asset_dir=asset_dir,
             )
         )
     print(f"Wrote {len(all_written)} images to {scene_dir}/renderings")
