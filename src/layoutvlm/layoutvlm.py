@@ -26,9 +26,22 @@ from utils.placement_utils import replace_z_rot_degree_to_rpy_radians
 
 
 def extract_python_program(input_text):
-    pattern = r"```python\n(.*?)```"
-    matches = re.findall(pattern, input_text, flags=re.DOTALL)
-    return matches
+    # Accept ```python, ```py, or bare ``` fences, with optional whitespace.
+    for pattern in (r"```(?:python|py)\s*\n(.*?)```", r"```\s*\n(.*?)```"):
+        matches = re.findall(pattern, input_text, flags=re.DOTALL)
+        if matches:
+            return [m.strip() for m in matches]
+    return []
+
+
+def _strip_code_fences(text):
+    """Remove stray leading/trailing markdown fence lines from code text."""
+    lines = text.splitlines()
+    while lines and lines[0].strip().startswith("```"):
+        lines = lines[1:]
+    while lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines)
 
 def extract_description_program(input_text):
     pattern = r"\*\*\*(.*?)\*\*\*"
@@ -42,16 +55,24 @@ def extract_json(input_text):
 
 class LayoutVLM:
 
-    def __init__(self, save_dir, gpt_4o_model_name="gpt-4o", asset_source="objaverse", mode="finetuned", visual_mark_mode="new_coord", 
+    def __init__(self, save_dir, gpt_4o_model_name="gpt-4o", asset_source="objaverse", mode="finetuned", visual_mark_mode="new_coord",
                  ft_original_model_id=None, ft_model_checkpoint=None, convert_z_rot_degree_to_rpy_radians=True, max_place_remaining_retry=2,
                  numerical_value_only=False):
         # initialize llm
         self.mode = mode
         self.asset_source = asset_source
         self.save_dir = save_dir
-        self.llm_slow = ChatOpenAI(model_name=gpt_4o_model_name, max_tokens=2048)
-        self.llm_slow_mini = ChatOpenAI(model_name="gpt-4o-mini", max_tokens=2048)
-        self.llm_slow_grouping = ChatOpenAI(model_name="gpt-4o", max_tokens=2048)
+        # Route through an OpenAI-compatible endpoint (chatanywhere by default)
+        # and standardise on a single pinned model for the audit. Override via
+        # VLMUNR_LLM_MODEL / OPENAI_BASE_URL.
+        import os as _os
+        _model = _os.environ.get("VLMUNR_LLM_MODEL", "gpt-5.1-2025-11-13")
+        _base = _os.environ.get("OPENAI_BASE_URL", "https://api.chatanywhere.tech/v1")
+        _key = _os.environ.get("OPENAI_API_KEY")
+        _kw = dict(max_tokens=8192, base_url=_base, api_key=_key)
+        self.llm_slow = ChatOpenAI(model_name=_model, **_kw)
+        self.llm_slow_mini = ChatOpenAI(model_name=_model, **_kw)
+        self.llm_slow_grouping = ChatOpenAI(model_name=_model, **_kw)
         self.visual_mark_mode = visual_mark_mode
         self.numerical_value_only = numerical_value_only
 
@@ -211,7 +232,8 @@ class LayoutVLM:
         if matches:
             constraint_program = matches[0]
         else:
-            constraint_program = response_text
+            # No clean fenced block; strip any stray fence lines from the raw text.
+            constraint_program = _strip_code_fences(response_text)
 
         ### remove re-initialized variables
         matches = list(re.finditer(r"\w+ = Assets\(", constraint_program))

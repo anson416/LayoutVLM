@@ -73,11 +73,11 @@ def prepare_task_assets(task, asset_dir):
                 "category": data["annotations"]["category"],
                 'description': data['annotations']['description'],
                 'path': data['path'],
-                'onCeiling': data['annotations']['onCeiling'],
-                'onFloor': data['annotations']['onFloor'],
-                'onWall': data['annotations']['onWall'],
-                'onObject': data['annotations']['onObject'],
-                'frontView': data['annotations']['frontView'],
+                'onCeiling': data['annotations'].get('onCeiling', False),
+                'onFloor': data['annotations'].get('onFloor', True),
+                'onWall': data['annotations'].get('onWall', False),
+                'onObject': data['annotations'].get('onObject', False),
+                'frontView': data['annotations'].get('frontView', 0),
                 'assetMetadata': {
                     "boundingBox": {
                         "x": float(data['assetMetadata']['boundingBox']['y']),  # SWAP x and y
@@ -103,6 +103,13 @@ def main():
     
     # Prepare assets
     scene_config = prepare_task_assets(scene_config, args.asset_dir)
+    # VLMUNR: persist the PREPARED task (category-keyed assets w/ embedded path+uid)
+    # so the audit renderer can join layout.json keys back to real GLBs.
+    try:
+        with open(os.path.join(args.save_dir, "prepared_task.json"), "w") as _f:
+            json.dump(scene_config, _f, indent=2)
+    except Exception as _e:
+        print("VLMUNR: could not save prepared_task.json:", _e)
     
     # Initialize constraint solver
     layout_solver = LayoutVLM(
