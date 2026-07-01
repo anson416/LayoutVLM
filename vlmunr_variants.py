@@ -49,11 +49,7 @@ REMOVAL_VARIANTS: List[Tuple[str, int]] = [
 ]
 
 # (dir name, rank offset) -- 0 == worst match.
-ALT_VARIANTS: List[Tuple[str, int]] = [
-    ("variant_alt_0", 0),
-    ("variant_alt_2", 2),
-    ("variant_alt_4", 4),
-]
+ALT_VARIANTS: List[Tuple[str, int]] = []  # VLMUNR: alt_* dropped
 
 # Category-aware worst-match substitution modes (dir name, mode).
 #   * ``within`` -- swap toward a *different* asset of the *same* category.
@@ -393,6 +389,8 @@ def make_category_subst_layout(
         "reason": "",
     }
 
+    import copy as _copy
+    _mod_task = _copy.deepcopy(task)
     assets = task.get("assets", {})
 
     lib_path = os.environ.get("VLMUNR_ASSET_LIBRARY")
@@ -408,7 +406,7 @@ def make_category_subst_layout(
             for inst_id in layout:
                 if inst_id in assets:
                     intent["substitutions"].append({inst_id: mode})
-            return dict(layout), intent
+            return dict(layout), intent, dict(task)
 
     if not candidates:
         intent["degraded"] = True
@@ -419,7 +417,7 @@ def make_category_subst_layout(
         for inst_id in layout:
             if inst_id in assets:
                 intent["substitutions"].append({inst_id: mode})
-        return dict(layout), intent
+        return dict(layout), intent, dict(task)
 
     # Library present: score candidates per instance, filtering by category.
     for inst_id in layout:
@@ -459,8 +457,22 @@ def make_category_subst_layout(
                 "candidate_path": chosen.get("path"),
             }
         )
+        # VLMUNR_PATCH real category subst
+        # Actually swap the asset for this instance in the (copied) task so the
+        # renderer loads a different mesh. Path drives the mesh; keep bbox from
+        # the candidate when available so scale stays sane.
+        _new_assets = _mod_task.setdefault("assets", {})
+        _ent = dict(_new_assets.get(inst_id, asset))
+        _cpath = chosen.get("path")
+        if _cpath:
+            _ent["path"] = _cpath
+            _cuid = os.path.basename(os.path.dirname(_cpath)) or _ent.get("uid")
+            _ent["uid"] = _cuid
+            _ent["category"] = chosen.get("category", _ent.get("category"))
+            _ent["description"] = chosen.get("description", _ent.get("description"))
+            _new_assets[inst_id] = _ent
 
-    return dict(layout), intent
+    return dict(layout), intent, _mod_task
 
 
 def _resolve_inputs(scene_dir: str) -> Tuple[str, str]:
@@ -476,7 +488,12 @@ def _resolve_inputs(scene_dir: str) -> Tuple[str, str]:
     ]
     if not task_candidates:
         raise FileNotFoundError(f"No task JSON found in {scene_dir}")
-    task_name = "task.json" if "task.json" in task_candidates else task_candidates[0]
+    if "prepared_task.json" in task_candidates:
+        task_name = "prepared_task.json"
+    elif "task.json" in task_candidates:
+        task_name = "task.json"
+    else:
+        task_name = task_candidates[0]
     return os.path.join(scene_dir, task_name), task_name
 
 
@@ -533,10 +550,12 @@ def generate_variants(scene_dir: str, seed: int = 42) -> List[str]:
         )
 
     for variant_dir, mode in SUBST_VARIANTS:
-        new_layout, intent = make_category_subst_layout(task, layout, mode)
+        new_layout, intent, mod_task = make_category_subst_layout(task, layout, mode)
+        # write the MODIFIED task (swapped assets) so the renderer loads
+        # different meshes for the substitution probe.
         written.append(
             _write_variant(
-                parent, variant_dir, task, task_name, new_layout, intent
+                parent, variant_dir, mod_task, task_name, new_layout, intent
             )
         )
 
