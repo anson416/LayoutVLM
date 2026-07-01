@@ -309,9 +309,41 @@ def is_mesh(obj: Object, raise_err: bool = False) -> bool:
 def import_obj(
     obj_path: str, load_vertex_colors: bool = False, use_shadow: bool = True
 ) -> Object:
+    # VLMUNR_PATCH import_obj glb-dispatch
+    import os as _os
+    _before = set(bpy.data.objects)
+    _ext = _os.path.splitext(obj_path)[1].lower()
     with redirect_stdout():
-        bpy.ops.wm.obj_import(filepath=obj_path)
-    obj = bpy.context.selected_objects[0]
+        if _ext in (".glb", ".gltf"):
+            bpy.ops.import_scene.gltf(filepath=obj_path)
+        else:
+            bpy.ops.wm.obj_import(filepath=obj_path)
+    _added = [o for o in bpy.data.objects if o not in _before]
+    _sel = list(bpy.context.selected_objects) or _added
+    if not _sel:
+        raise RuntimeError("import produced no objects: " + obj_path)
+    if _ext in (".glb", ".gltf"):
+        _added_names = [o.name for o in _added]
+        _meshes = [o for o in _added if getattr(o, "type", None) == "MESH"]
+        if not _meshes:
+            obj = _sel[0]
+        else:
+            obj = _meshes[0]; _on = obj.name
+            if len(_meshes) > 1:
+                bpy.ops.object.select_all(action="DESELECT")
+                for _m in _meshes: _m.select_set(True)
+                bpy.context.view_layer.objects.active = obj
+                with redirect_stdout():
+                    bpy.ops.object.join()
+            obj = bpy.data.objects[_on]
+            for _nm in _added_names:
+                _o = bpy.data.objects.get(_nm)
+                if _o is not None and _o.name != obj.name and getattr(_o, "type", None) != "MESH":
+                    try: bpy.data.objects.remove(_o, do_unlink=True)
+                    except Exception: pass
+        obj.visible_shadow = use_shadow
+        return obj
+    obj = _sel[0]
 
     if load_vertex_colors and is_mesh(obj):
         colors = []

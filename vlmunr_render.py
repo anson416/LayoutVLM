@@ -310,12 +310,39 @@ def load_scene_into_blender(task: Dict, layout: Dict, asset_dir: str = None):
             # still renders.
             continue
         obj = bpa.import_obj(path)
+        # VLMUNR_PATCH fit-to-bbox scale
+        # Rescale mesh to its target boundingBox BEFORE the placement transform.
+        # Assets are not uniformly authored in meters; fit measured dims to the
+        # target bbox so the room stays at its intended 4x5 m scale.
+        try:
+            import bpy as _bpy  # noqa
+            _bb = rec.get("bbox") or {}
+            _d = obj.dimensions
+            # prepare_task_assets swapped x<->y in bbox; obj.dimensions is (x,y,z)
+            _tx = float(_bb.get("y", _d.x)); _ty = float(_bb.get("x", _d.y)); _tz = float(_bb.get("z", _d.z))
+            _sx = _tx / _d.x if _d.x else 1.0
+            _sy = _ty / _d.y if _d.y else 1.0
+            _sz = _tz / _d.z if _d.z else 1.0
+        except Exception:
+            _sx = _sy = _sz = 1.0
+        # Apply the fit-to-bbox scale first.
+        obj.scale = (_sx * obj.scale.x, _sy * obj.scale.y, _sz * obj.scale.z)
+        import bpy as _b2
+        _b2.context.view_layer.update()
+        # HARD CLAMP: no imported asset may exceed 3.5 m on any axis (guards
+        # against unreliable bbox metadata). Uniformly shrink if it does.
+        _dd = obj.dimensions
+        _mx = max(_dd.x, _dd.y, _dd.z)
+        if _mx > 3.5:
+            _f = 3.5 / _mx
+            obj.scale = (obj.scale.x*_f, obj.scale.y*_f, obj.scale.z*_f)
+            _b2.context.view_layer.update()
         tf = compute_object_transform(rec)
         bpa.transform(
             obj,
             position=tf["position"],
             rotation=tf["rotation"],
-            scale=tf["scale"],
+            scale=None,
         )
         imported.append(rec)
     return imported
@@ -324,6 +351,30 @@ def load_scene_into_blender(task: Dict, layout: Dict, asset_dir: str = None):
 def _hdri_path(hdri: str) -> str:
     here = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(here, "vlmunr_hdri", f"{hdri}.exr")
+
+
+def _build_lvlm_shell(task):
+    """Build floor+walls from task boundary.floor_vertices + wall_height.
+    Z-up meters, polygon at z=0. Returns wall objects (tagged) for culling."""
+    try:
+        import bpy  # noqa
+        import vlmunr_shell as _vs
+    except Exception:
+        return []
+    b = (task or {}).get("boundary", {}) or {}
+    fv = b.get("floor_vertices") or []
+    if len(fv) < 3:
+        return []
+    verts = [(float(v[0]), float(v[1])) for v in fv]
+    wh = float(b.get("wall_height", 2.5) or 2.5)
+    if wh < 1.2:
+        wh = 2.5  # some tasks store an implausibly short wall height
+    try:
+        return _vs.build_room_shell(bpy, verts, wh, margin=0.0, ceiling=False)
+    except Exception as _e:
+        print("VLMUNR lvlm shell build failed:", _e)
+        return []
+
 
 
 def render_phase(
@@ -356,8 +407,13 @@ def render_phase(
         env = _hdri_path(hdri)
         if not os.path.exists(env):
             raise FileNotFoundError(f"HDRI not found: {env}")
-        bpa.initialize(transparent=True, environment_map=(env, env_strength))
+        # Load geometry FIRST: load_scene_into_blender calls bpa.clear() which
+        # wipes bpy.data.worlds, so the HDRI world must be set AFTER it or the
+        # scene renders unlit/black.
         load_scene_into_blender(task, layout, asset_dir)
+        # VLMUNR_PATCH room shell
+        _VLMUNR_WALLS = _build_lvlm_shell(task)
+        bpa.initialize(transparent=True, environment_map=(env, env_strength))
         current_hdri = hdri
         scene_loaded = True
 
@@ -374,6 +430,11 @@ def render_phase(
                     spec["hdri"],
                 ),
             )
+            try:
+                import vlmunr_shell as _vs
+                _vs.cull_walls(_VLMUNR_WALLS, spec["pitch"], spec["yaw"])
+            except Exception:
+                pass
             renderer = bpa.Renderer()
             renderer.render_perspective(
                 master,
@@ -382,6 +443,7 @@ def render_phase(
                 rotation=(spec["pitch"], 0, spec["yaw"]),
                 resolution=spec["res"],
                 focal_length=spec["focal"],
+                fit_ratio=0.6,
                 background=None,
             )
             written.append(master)
