@@ -142,8 +142,13 @@ def distance_loss(coord1, coord2, min_distance=1.0, max_distance=3.0):
 
 def is_point_on_line_segment(point, line_start, line_end):
     """Check if a point lies on a line segment."""
-    return (np.cross(line_end - line_start, point - line_start) == 0 and 
-            np.dot(line_end - line_start, point - line_start) >= 0 and 
+    # np.cross no longer supports 2-D vectors in NumPy ≥1.25; compute the
+    # scalar z-component of the 2-D cross product explicitly.
+    a = line_end - line_start
+    b = point - line_start
+    cross_z = float(a[0]) * float(b[1]) - float(a[1]) * float(b[0])
+    return (cross_z == 0 and
+            np.dot(line_end - line_start, point - line_start) >= 0 and
             np.dot(line_start - line_end, point - line_end) >= 0)
 
 def ray_intersects_segment(origin, direction, v1, v2):
@@ -156,15 +161,19 @@ def ray_intersects_segment(origin, direction, v1, v2):
         return True
     
     # Calculate the intersection point
+    # Use scalar 2-D cross product (z-component): cross2d(a,b) = a[0]*b[1] - a[1]*b[0]
     v = v2 - v1
-    cross_product = np.cross(direction, v)
-    
+    def cross2d(a, b):
+        return float(a[0]) * float(b[1]) - float(a[1]) * float(b[0])
+
+    cross_product = cross2d(direction, v)
+
     # Check if the ray is parallel to the line segment
     if abs(cross_product) < 1e-8:
         return False
-    
-    t = np.cross(v1 - origin, v) / cross_product
-    u = np.cross(direction, origin - v1) / cross_product
+
+    t = cross2d(v1 - origin, v) / cross_product
+    u = cross2d(direction, origin - v1) / cross_product
     
     # Check if the intersection point is on the line segment and in the direction of the ray
     return t >= 0 and 0 <= u <= 1

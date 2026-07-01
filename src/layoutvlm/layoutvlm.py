@@ -69,7 +69,7 @@ class LayoutVLM:
         _model = _os.environ.get("VLMUNR_LLM_MODEL", "gpt-5.1-2025-11-13")
         _base = _os.environ.get("OPENAI_BASE_URL", "https://api.chatanywhere.tech/v1")
         _key = _os.environ.get("OPENAI_API_KEY")
-        _kw = dict(max_tokens=2048, base_url=_base, api_key=_key)
+        _kw = dict(max_tokens=8192, base_url=_base, api_key=_key)
         self.llm_slow = ChatOpenAI(model_name=_model, **_kw)
         self.llm_slow_mini = ChatOpenAI(model_name=_model, **_kw)
         self.llm_slow_grouping = ChatOpenAI(model_name=_model, **_kw)
