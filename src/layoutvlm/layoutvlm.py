@@ -69,7 +69,7 @@ class LayoutVLM:
         _model = _os.environ.get("VLMUNR_LLM_MODEL", "gpt-5.1-2025-11-13")
         _base = _os.environ.get("OPENAI_BASE_URL", "https://api.chatanywhere.tech/v1")
         _key = _os.environ.get("OPENAI_API_KEY")
-        _kw = dict(max_tokens=2048, base_url=_base, api_key=_key)
+        _kw = dict(max_tokens=16384, base_url=_base, api_key=_key)
         self.llm_slow = ChatOpenAI(model_name=_model, **_kw)
         self.llm_slow_mini = ChatOpenAI(model_name=_model, **_kw)
         self.llm_slow_grouping = ChatOpenAI(model_name=_model, **_kw)
@@ -296,8 +296,8 @@ class LayoutVLM:
                 assert value['count'] == verify_asset_var_name_to_count[asset['asset_var_name']], (
                     "value['count'] ({}) != verify_asset_var_name_to_count[asset['asset_var_name']] ({}) for {}".format(
                         value['count'], verify_asset_var_name_to_count[asset['asset_var_name']], asset['asset_var_name']))
-            program += (f"{asset['asset_var_name']} = Assets("
-                f"description=\"{asset['description']}\", "
+            program += (f"{re.sub(r'[^A-Za-z0-9_]', '_', asset['asset_var_name'])} = Assets("
+                f"description={(asset['description'] or '')!r}, "
                 f"size={size_str}, "
                 f"placements=[AssetInstance() for _ in range({value['count']})])\n"
             )
@@ -328,8 +328,8 @@ class LayoutVLM:
                 assert value['count'] == verify_asset_var_name_to_count[asset['asset_var_name']], (
                     "value['count'] ({}) != verify_asset_var_name_to_count[asset['asset_var_name']] ({}) for {}".format(
                         value['count'], verify_asset_var_name_to_count[asset['asset_var_name']], asset['asset_var_name']))
-            program += (f"{asset['asset_var_name']} = Assets("
-                f"description=\"{asset['description']}\", "
+            program += (f"{re.sub(r'[^A-Za-z0-9_]', '_', asset['asset_var_name'])} = Assets("
+                f"description={(asset['description'] or '')!r}, "
                 f"size={size_str}, "
                 f"placements=[AssetInstance() for _ in range({value['count']})])\n"
             )
@@ -453,8 +453,7 @@ class LayoutVLM:
 
 
         for attempt_idx in range(MAX_ATTEMPTS):
-            # try:
-            if True:
+            try:
                 # clear constraints
                 self.sandbox.execute_code("solver.constraints = []\n")
                 save_path = f"{_save_dir}/llm_output_program_{attempt_idx}.py"
@@ -481,16 +480,21 @@ class LayoutVLM:
                     placed_assets, group_assets, constraint_program, save_dir=_save_dir, only_initialize=only_initialize
                 )
                 break
-            # except Exception as e:
-            #     print("Retrying ...", e)
+            except Exception as e:
+                print("Retrying ...", e)
 
         return placed_assets
 
-    def solve(self, original_task, MAX_ATTEMPTS=3):
+    def solve(self, original_task, MAX_ATTEMPTS=8):
         """
         task is the input json of the scene and the assets 
         """
         task = original_task.copy()
+        # sanitize asset_var_name so it is a valid Python identifier everywhere downstream
+        import re as _re
+        for _uid, _asset in task.get("assets", {}).items():
+            if "asset_var_name" in _asset:
+                _asset["asset_var_name"] = _re.sub(r"[^A-Za-z0-9_]", "_", _asset["asset_var_name"])
         #### initialize the sandbox and initialize all the variables
         self.sandbox = SandBoxEnv(task, mode=self.mode, save_dir=self.save_dir)
         task_program = self.get_task_program(list(task["assets"].keys()), task)
@@ -615,8 +619,8 @@ class LayoutVLM:
                 asset['assetMetadata']['boundingBox']['y'],
                 asset['assetMetadata']['boundingBox']['z']
             )
-            program += (f"{asset['asset_var_name']} = Assets("
-                f"description=\"{asset['description']}\", "
+            program += (f"{re.sub(r'[^A-Za-z0-9_]', '_', asset['asset_var_name'])} = Assets("
+                f"description={(asset['description'] or '')!r}, "
                 f"size={size_str}, "
                 f"placements=[AssetInstance() for _ in range({value['count']})])\n"
             )

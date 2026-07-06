@@ -44,7 +44,7 @@ class SandBoxEnv:
     def initialize_variables(self):
         setup_code = ""
         for original_uid, asset in self.task["assets"].items():
-            var_name = asset["asset_var_name"]
+            var_name = re.sub(r'[^A-Za-z0-9_]', '_', asset["asset_var_name"])
             asset_idx = int(original_uid.split('-')[-1])
             position = get_random_placement(self.task["boundary"]["floor_vertices"], add_z=True)
             position[-1] = asset["assetMetadata"]["boundingBox"]["z"]/2
@@ -388,7 +388,7 @@ class SandBoxEnv:
         results = dict()
         if incomplete_scene:
             for original_uid, asset in self.task["assets"].items():
-                var_name = asset["asset_var_name"]
+                var_name = re.sub(r'[^A-Za-z0-9_]', '_', asset["asset_var_name"])
                 asset_idx = int(original_uid.split('-')[-1])
                 if self.local_vars[var_name].placements[asset_idx].optimize == 2:
                     assert self.local_vars[var_name].placements[asset_idx].position
@@ -398,7 +398,7 @@ class SandBoxEnv:
                     }
         else:
             for original_uid, asset in self.task["assets"].items():
-                var_name = asset["asset_var_name"]
+                var_name = re.sub(r'[^A-Za-z0-9_]', '_', asset["asset_var_name"])
                 asset_idx = int(original_uid.split('-')[-1])
                 try:
                     results[original_uid] = {
