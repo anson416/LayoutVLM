@@ -384,28 +384,55 @@ class SandBoxEnv:
 
         return constraints_for_solver
 
+    @staticmethod
+    def _to_plain_list(value):
+        """Coerce a position/rotation value (torch.Tensor / np.ndarray / list)
+        into a plain Python list of floats for JSON serialization.
+
+        LayoutVLM stores positions as ``torch.nn.Parameter`` tensors and
+        rotations as 2-element cosine/sin tensors. ``json.dump`` cannot
+        serialize tensors, so every exported value is forced to plain floats
+        here.  ``None`` is preserved (used by the incomplete-scene skip path).
+        """
+
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().numpy()
+        # numpy scalar / array -> python list of python floats.
+        return [float(v) for v in list(value)]
+
     def export_layout(self, incomplete_scene=False, use_degree=True):
         results = dict()
         if incomplete_scene:
             for original_uid, asset in self.task["assets"].items():
                 var_name = re.sub(r'[^A-Za-z0-9_]', '_', asset["asset_var_name"])
                 asset_idx = int(original_uid.split('-')[-1])
-                if self.local_vars[var_name].placements[asset_idx].optimize == 2:
-                    assert self.local_vars[var_name].placements[asset_idx].position
+                inst = self.local_vars[var_name].placements[asset_idx]
+                # Use `.position is None` (not truthiness) -- position is a
+                # torch tensor whose bool() raises on >1 element.
+                if inst.optimize == 2 and inst.position is not None:
                     results[original_uid] = {
-                        "position": self.local_vars[var_name].placements[asset_idx].position,
-                        "rotation": [np.rad2deg(x) for x in self.local_vars[var_name].placements[asset_idx].rotation]
+                        "position": self._to_plain_list(inst.position),
+                        "rotation": self._to_plain_list(
+                            [np.rad2deg(x) for x in inst.rotation]
+                            if use_degree else inst.rotation
+                        ),
                     }
         else:
             for original_uid, asset in self.task["assets"].items():
                 var_name = re.sub(r'[^A-Za-z0-9_]', '_', asset["asset_var_name"])
                 asset_idx = int(original_uid.split('-')[-1])
                 try:
+                    inst = self.local_vars[var_name].placements[asset_idx]
                     results[original_uid] = {
-                        "position": self.local_vars[var_name].placements[asset_idx].position,
-                        "rotation": [np.rad2deg(x) for x in self.local_vars[var_name].placements[asset_idx].rotation]
+                        "position": self._to_plain_list(inst.position),
+                        "rotation": self._to_plain_list(
+                            [np.rad2deg(x) for x in inst.rotation]
+                            if use_degree else inst.rotation
+                        ),
                     }
-                except:
+                except Exception:
                     print(f"extract placement for asset {original_uid} failed.")
         return results
 

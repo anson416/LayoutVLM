@@ -695,3 +695,46 @@ def test_cli_missing_api_key_errors(tmp_path):
         if key is not None:
             os.environ["OPENAI_API_KEY"] = key
     assert rc == 2
+
+
+# ===========================================================================
+# (e) Serialization safety (Q7): layouts must be JSON-serializable
+# ===========================================================================
+
+
+def test_export_layout_serializes_tensors():
+    """Real-mode positions are torch tensors; export_layout must emit floats.
+
+    Guards against the TypeError: Object of type Tensor is not JSON
+    serializable crash when json.dump'ing a layout produced by the solver.
+    """
+    import json as _json
+    import torch as _torch
+    from src.layoutvlm.sandbox import SandBoxEnv
+
+    task = make_synthetic_task(2)
+    sb = SandBoxEnv(task, mode="one_shot")
+    # Inject tensor-valued positions/rotations like the solver leaves behind.
+    class _Inst:
+        optimize = 2
+        position = _torch.tensor([1.0, 2.0, 3.0])
+        rotation = _torch.tensor([0.5, 0.5])  # cos/sin
+
+    class _Assets:
+        placements = [_Inst(), _Inst()]
+
+    class _Local(dict):
+        pass
+
+    sb.local_vars = {"bed": _Assets()}
+    # Patch task asset_var_name so var_name resolves to "bed".
+    for k in task["assets"]:
+        task["assets"][k]["asset_var_name"] = "bed"
+    sb.task = task
+    out = sb.export_layout(incomplete_scene=True)
+    # Must be JSON-serializable and contain plain floats.
+    s = _json.dumps(out)
+    assert "1.0" in s and "2.0" in s
+    for v in out.values():
+        assert all(isinstance(x, float) for x in v["position"])
+        assert all(isinstance(x, float) for x in v["rotation"])

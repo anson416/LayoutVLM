@@ -57,6 +57,32 @@ import vlmunr_variants as variants  # noqa: E402
 from main import prepare_task_assets  # noqa: E402
 
 
+def _json_default(obj):
+    """``json.dump`` default hook: coerce numpy/torch values to plain Python.
+
+    The gradient solver may leave positions/rotations as ``torch.Tensor`` or
+    ``numpy`` scalars; without this hook ``json.dump`` raises ``TypeError:
+    Object of type Tensor is not JSON serializable``.  Unknown types fall back
+    to ``str(obj)`` rather than crashing the whole generation.
+    """
+
+    try:
+        import numpy as _np
+        if isinstance(obj, _np.generic):
+            return obj.item()
+        if isinstance(obj, _np.ndarray):
+            return obj.tolist()
+    except Exception:
+        pass
+    try:
+        import torch as _torch
+        if isinstance(obj, _torch.Tensor):
+            return obj.detach().cpu().tolist()
+    except Exception:
+        pass
+    return str(obj)
+
+
 # ---------------------------------------------------------------------------
 # CLI args
 # ---------------------------------------------------------------------------
@@ -210,7 +236,7 @@ def main(argv: List[str] = None) -> int:
         )
         layout = solver.solve(task)
     with open(os.path.join(run_dir, "layout.json"), "w") as f:
-        json.dump(layout, f, indent=2)
+        json.dump(layout, f, indent=2, default=_json_default)
     print(f"      base scene: {len(layout)} placed instance(s).")
 
     # --- 4. variants (Q2-Q5), no re-solve ---
