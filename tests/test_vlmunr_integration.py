@@ -611,7 +611,7 @@ def test_bpy_smoke_render_cube(tmp_path):
 
 
 # ===========================================================================
-# (d) Text->scene CLI (generate_scene.py) in --mock mode
+# (d) Text->scene CLI (cli.py) in --mock mode
 # ===========================================================================
 
 
@@ -632,7 +632,7 @@ def _make_synthetic_asset_dir(tmp_path, cats):
 
 
 def test_cli_mock_mode_end_to_end(tmp_path):
-    import generate_scene as cli
+    import cli
 
     asset_dir = _make_synthetic_asset_dir(tmp_path, [
         ("bed", "a queen bed"), ("chair", "a rattan chair"),
@@ -687,7 +687,7 @@ def test_cli_mock_mode_end_to_end(tmp_path):
 
 
 def test_cli_missing_api_key_errors(tmp_path):
-    import generate_scene as cli
+    import cli
     # Clear any inherited OPENAI_API_KEY for this test only.
     key = os.environ.pop("OPENAI_API_KEY", None)
     try:

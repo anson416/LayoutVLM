@@ -57,21 +57,27 @@ Refer to https://github.com/allenai/Holodeck and https://github.com/allenai/obja
 python main.py --scene_json_file path/to/scene.json --openai_api_key your_api_key
 ```
 
-## Text-to-scene CLI (`generate_scene.py`)
+## Text-to-scene CLI (`cli.py`)
 
 Generate a scene from a textual description instead of a hand-authored scene
 JSON. It turns the prompt into a room boundary + asset shopping list (one
 LLM call), resolves those against a processed-asset directory, runs the solver,
-and writes the result to `outputs/<YYYYMMDD-HHMMSS UTC>/`.
+and writes the result to `outputs/<YYYYMMDD-HHMMSS UTC>/`. The full list of
+external local resources this method requires (processed Objaverse assets,
+HDRIs, optional asset library, bpy, the Rotated-IoU CUDA op, an LLM endpoint)
+and how to prepare each one is documented in the **top docstring of `cli.py`**
+(`python cli.py --help`, or read `cli.py`).
 
 ```bash
-python generate_scene.py \
+python cli.py \
     --prompt "a cozy beach-inspired bedroom, 4m x 5m, with a queen bed and a rattan chair" \
     --base_url https://api.openai.com/v1 \
     --api_key sk-... \
     --model gpt-4o \
     --temperature 0.0 \
-    --asset_dir ./objaverse_processed
+    --asset_dir ./objaverse_processed \
+    --hdri_dir ./vlmunr_hdri \
+    --variants
 ```
 
 Each run folder contains `config.json` (prompt + LLM config; the API key is
