@@ -57,6 +57,42 @@ Refer to https://github.com/allenai/Holodeck and https://github.com/allenai/obja
 python main.py --scene_json_file path/to/scene.json --openai_api_key your_api_key
 ```
 
+## Text-to-scene CLI (`generate_scene.py`)
+
+Generate a scene from a textual description instead of a hand-authored scene
+JSON. It turns the prompt into a room boundary + asset shopping list (one
+LLM call), resolves those against a processed-asset directory, runs the solver,
+and writes the result to `outputs/<YYYYMMDD-HHMMSS UTC>/`.
+
+```bash
+python generate_scene.py \
+    --prompt "a cozy beach-inspired bedroom, 4m x 5m, with a queen bed and a rattan chair" \
+    --base_url https://api.openai.com/v1 \
+    --api_key sk-... \
+    --model gpt-4o \
+    --temperature 0.0 \
+    --asset_dir ./objaverse_processed
+```
+
+Each run folder contains `config.json` (prompt + LLM config; the API key is
+stored **redacted** only), `scene_spec.json`, `prepared_task.json`, and the
+base `layout.json`.
+
+* `--variants` also writes four content variants as sub-directories, **without
+  re-running the LLM or solver** (they fork the base layout):
+  - `variant_01_half` — keep round(n/2) instances (seeded)
+  - `variant_02_biggest-only` — keep the single largest instance (bbox volume)
+  - `variant_03_scrambled` — relocate every instance within the floor polygon,
+    preserving z/rotation/identity (objects stay in their region)
+  - `variant_04_worst-object` — swap each instance's asset identity to the
+    worst-matching candidate from `--asset_library` (requires the library)
+* `--mock` skips the LLM + gradient solver and places assets at random floor
+  points, so the whole pipeline + variants are exercisable offline without
+  GPU/Blender or API cost.
+* `--asset_library path.json` — JSON list of
+  `{"category","description","path"[,"assetMetadata":{"boundingBox":...}]}`,
+  required for the worst-object variant.
+
 ## Output
 The script will generate a layout.json file in the specified save directory containing the optimized positions and orientations of all assets in the scene.
 
