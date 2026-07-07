@@ -57,22 +57,30 @@ class LayoutVLM:
 
     def __init__(self, save_dir, gpt_4o_model_name="gpt-4o", asset_source="objaverse", mode="finetuned", visual_mark_mode="new_coord",
                  ft_original_model_id=None, ft_model_checkpoint=None, convert_z_rot_degree_to_rpy_radians=True, max_place_remaining_retry=2,
-                 numerical_value_only=False):
+                 numerical_value_only=False, model=None, base_url=None, api_key=None, temperature=0.0):
         # initialize llm
         self.mode = mode
         self.asset_source = asset_source
         self.save_dir = save_dir
         # Route through an OpenAI-compatible endpoint (chatanywhere by default)
         # and standardise on a single pinned model for the audit. Override via
-        # VLMUNR_LLM_MODEL / OPENAI_BASE_URL.
+        # explicit args (preferred, from the CLI) or the VLMUNR_LLM_MODEL /
+        # OPENAI_BASE_URL / OPENAI_API_KEY env vars.
         import os as _os
-        _model = _os.environ.get("VLMUNR_LLM_MODEL", "gpt-5.1-2025-11-13")
-        _base = _os.environ.get("OPENAI_BASE_URL", "https://api.chatanywhere.tech/v1")
-        _key = _os.environ.get("OPENAI_API_KEY")
-        _kw = dict(max_tokens=16384, base_url=_base, api_key=_key)
-        self.llm_slow = ChatOpenAI(model_name=_model, **_kw)
-        self.llm_slow_mini = ChatOpenAI(model_name=_model, **_kw)
-        self.llm_slow_grouping = ChatOpenAI(model_name=_model, **_kw)
+        _model = model or _os.environ.get("VLMUNR_LLM_MODEL", "gpt-5.1-2025-11-13")
+        _base = base_url or _os.environ.get("OPENAI_BASE_URL", "https://api.chatanywhere.tech/v1")
+        _key = api_key or _os.environ.get("OPENAI_API_KEY")
+        _temperature = float(temperature) if temperature is not None else 0.0
+        # max_tokens is intentionally omitted for providers that error on it
+        # when a model defaults to its own cap; keep it for known-good pinning.
+        _kw = dict(base_url=_base, api_key=_key, temperature=_temperature)
+        self.llm_slow = ChatOpenAI(model_name=_model, max_tokens=16384, **_kw)
+        self.llm_slow_mini = ChatOpenAI(model_name=_model, max_tokens=16384, **_kw)
+        self.llm_slow_grouping = ChatOpenAI(model_name=_model, max_tokens=16384, **_kw)
+        # Expose the resolved LLM config for logging/auditing.
+        self.llm_model = _model
+        self.llm_base_url = _base
+        self.llm_temperature = _temperature
         self.visual_mark_mode = visual_mark_mode
         self.numerical_value_only = numerical_value_only
 

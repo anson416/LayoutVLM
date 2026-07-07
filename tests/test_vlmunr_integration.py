@@ -603,3 +603,95 @@ def test_bpy_smoke_render_cube(tmp_path):
             except Exception:
                 pass
         sys.stdout, sys.stderr = saved_out, saved_err
+
+
+# ===========================================================================
+# (d) Text->scene CLI (generate_scene.py) in --mock mode
+# ===========================================================================
+
+
+def _make_synthetic_asset_dir(tmp_path, cats):
+    """Write a minimal processed-asset dir: <uid>/data.json + <uid>.glb."""
+    import json as _json
+    base = tmp_path / "assets"
+    for i, (cat, desc) in enumerate(cats):
+        d = base / f"uid{i:02d}"
+        d.mkdir(parents=True)
+        (d / "data.json").write_text(_json.dumps({
+            "annotations": {"category": cat, "description": desc,
+                            "onFloor": True, "onCeiling": False, "onWall": False},
+            "assetMetadata": {"boundingBox": {"x": 1.0, "y": 1.0, "z": 0.4}},
+        }))
+        (d / f"uid{i:02d}.glb").write_text("fake")
+    return base
+
+
+def test_cli_mock_mode_end_to_end(tmp_path):
+    import generate_scene as cli
+
+    asset_dir = _make_synthetic_asset_dir(tmp_path, [
+        ("bed", "a queen bed"), ("chair", "a rattan chair"),
+        ("table", "a small table"), ("lamp", "a floor lamp"),
+    ])
+    lib_path = tmp_path / "lib.json"
+    lib_path.write_text(json.dumps([
+        {"category": "boulder", "description": "a heavy grey rock",
+         "path": str(tmp_path / "boulder.glb"),
+         "assetMetadata": {"boundingBox": {"x": 2, "y": 2, "z": 2}}},
+    ]))
+    out_root = tmp_path / "outputs"
+
+    rc = cli.main([
+        "--prompt", "a cozy bedroom with a bed and a chair",
+        "--api_key", "sk-test1234567890",
+        "--mock", "--variants",
+        "--asset_dir", str(asset_dir),
+        "--asset_library", str(lib_path),
+        "--outputs_dir", str(out_root),
+    ])
+    assert rc == 0
+
+    runs = sorted(os.listdir(out_root))
+    assert len(runs) == 1
+    run = out_root / runs[0]
+    # run folder name is YYYYMMDD-HHMMSS in UTC
+    assert len(runs[0]) == 15 and runs[0][8] == "-"
+
+    # config + base layout + prepared task present; api key redacted
+    cfg = json.load(open(run / "config.json"))
+    assert cfg["prompt"] == "a cozy bedroom with a bed and a chair"
+    assert cfg["mock"] is True
+    assert cfg["variants"] is True
+    assert cfg["api_key_redacted"].startswith("sk-t")
+    assert "7890" in cfg["api_key_redacted"]
+    assert "sk-test1234567890" not in json.dumps(cfg)
+    assert os.path.exists(run / "layout.json")
+    assert os.path.exists(run / "prepared_task.json")
+
+    # the four named variants exist with layout.json
+    for name in ["variant_01_half", "variant_02_biggest-only",
+                 "variant_03_scrambled", "variant_04_worst-object"]:
+        v = run / name
+        assert v.is_dir(), name
+        assert os.path.exists(v / "layout.json"), name
+
+    # worst-object variant swapped the asset identity to the library candidate
+    worst_task = json.load(open(run / "variant_04_worst-object" / "task.json"))
+    for ent in worst_task["assets"].values():
+        assert "boulder" in ent["path"]
+
+
+def test_cli_missing_api_key_errors(tmp_path):
+    import generate_scene as cli
+    # Clear any inherited OPENAI_API_KEY for this test only.
+    key = os.environ.pop("OPENAI_API_KEY", None)
+    try:
+        rc = cli.main([
+            "--prompt", "x", "--mock",
+            "--asset_dir", str(tmp_path),
+            "--outputs_dir", str(tmp_path / "outputs"),
+        ])
+    finally:
+        if key is not None:
+            os.environ["OPENAI_API_KEY"] = key
+    assert rc == 2

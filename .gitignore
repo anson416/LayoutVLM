@@ -1,3 +1,6 @@
 __pycache__
 results/*
 objaverse_processed/
+outputs/
+tests/_synthetic_assets/
+tests/_synthetic_lib.json
