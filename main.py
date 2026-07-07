@@ -3,9 +3,12 @@ import json
 import argparse
 import numpy as np
 import collections
-from src.layoutvlm.scene import Scene
-from src.layoutvlm.layoutvlm import LayoutVLM
 from utils.placement_utils import get_random_placement
+
+# LayoutVLM and Scene pull in bpy (Blender) + torch at import time.  They are
+# only needed by main()'s solve path, so import them lazily inside main() to
+# keep prepare_task_assets() (pure) importable without bpy -- the CLI's --mock
+# path and the variant/audit tooling only need prepare_task_assets.
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -112,6 +115,7 @@ def main():
         print("VLMUNR: could not save prepared_task.json:", _e)
     
     # Initialize constraint solver
+    from src.layoutvlm.layoutvlm import LayoutVLM  # lazy: pulls in bpy + torch
     layout_solver = LayoutVLM(
         mode="one_shot",
         save_dir=args.save_dir,

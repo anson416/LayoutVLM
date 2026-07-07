@@ -156,7 +156,11 @@ def main(argv: List[str] = None) -> int:
         return 2
 
     # --- run folder: outputs/<YYYYMMDD-HHMMSS> (UTC) ---
-    stamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d-%H%M%S")
+    # datetime.UTC exists on 3.11+; datetime.timezone.utc is the 3.10-compatible
+    # spelling of the same object, so the call matches the requested
+    # datetime.datetime.now(datetime.UTC) form across versions.
+    _utc = getattr(datetime, "UTC", None) or datetime.timezone.utc
+    stamp = datetime.datetime.now(_utc).strftime("%Y%m%d-%H%M%S")
     run_dir = os.path.join(args.outputs_dir, stamp)
     os.makedirs(run_dir, exist_ok=True)
 

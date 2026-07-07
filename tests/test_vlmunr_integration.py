@@ -529,13 +529,18 @@ def test_scene_center_radius():
 
 
 # --- bpy smoke ------------------------------------------------------------
+# NOTE: bpy is imported per-test (via pytest.importorskip inside the test body)
+# rather than at module scope. A module-scope importorskip would skip the
+# *entire* file when bpy is absent, hiding all the pure-function tests above
+# (and the CLI/serialization tests below) on environments without Blender.
 
-bpy = pytest.importorskip("bpy")
+bpy = None  # populated lazily inside test_bpy_smoke_render_cube
 
 
 def test_bpy_smoke_render_cube(tmp_path):
     import io
-
+    # Skip just this test (not the whole module) when bpy is unavailable.
+    pytest.importorskip("bpy")
     import vlmunr_bpa as bpa
     from conftest import real_terminal_fds
 
@@ -707,9 +712,11 @@ def test_export_layout_serializes_tensors():
 
     Guards against the TypeError: Object of type Tensor is not JSON
     serializable crash when json.dump'ing a layout produced by the solver.
+    Skipped when bpy/torch are unavailable (it exercises the solver stack).
     """
     import json as _json
     import torch as _torch
+    pytest.importorskip("bpy")
     from src.layoutvlm.sandbox import SandBoxEnv
 
     task = make_synthetic_task(2)

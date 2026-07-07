@@ -153,10 +153,20 @@ class LayoutVLM:
                     with open(f"{save_dir}/grouping_{attempt_idx}.txt", "w") as f:
                         f.write(prompt + "\n\n" + response.content)
                 matches = extract_json(response.content)
+                if not matches:
+                    raise ValueError("no JSON block found in LLM grouping response")
                 result = json.loads(matches[-1])
+                if "list" not in result:
+                    raise ValueError(f"grouping JSON missing 'list' key: {list(result.keys())}")
                 return result["list"]
             except Exception as e:
                 print("Retrying in get_asset_groups ...", e)
+        # All retries exhausted: fail loudly rather than returning None, which
+        # would later crash solve() with an opaque 'NoneType is not iterable'.
+        raise RuntimeError(
+            f"get_asset_groups failed after {MAX_ATTEMPTS} attempts "
+            "(see grouping_*.txt in save_dir for the raw LLM responses)"
+        )
 
 
 
