@@ -311,7 +311,7 @@ def test_subst_within_intent_recording_degraded(monkeypatch):
     monkeypatch.delenv("VLMUNR_ASSET_LIBRARY", raising=False)
     task = make_synthetic_task(4)
     layout = make_synthetic_layout(4)
-    new_layout, intent = variants.make_category_subst_layout(
+    new_layout, intent, _ = variants.make_category_subst_layout(
         task, layout, "within"
     )
     # scene unchanged
@@ -330,7 +330,7 @@ def test_subst_cross_intent_recording_degraded(monkeypatch):
     monkeypatch.delenv("VLMUNR_ASSET_LIBRARY", raising=False)
     task = make_synthetic_task(3)
     layout = make_synthetic_layout(3)
-    new_layout, intent = variants.make_category_subst_layout(
+    new_layout, intent, _ = variants.make_category_subst_layout(
         task, layout, "cross"
     )
     assert new_layout == layout
@@ -348,6 +348,114 @@ def test_subst_invalid_mode_raises():
         variants.make_category_subst_layout(task, layout, "bogus")
 
 
+# ===========================================================================
+# (b3) Named variants for the text->scene CLI (biggest-only, worst-object)
+# ===========================================================================
+
+
+def test_biggest_only_keeps_single_largest():
+    task = make_synthetic_task(4)
+    # synthetic assets all have bbox 1x1x0.4 -> tie; make uid01 the biggest.
+    task["assets"]["uid01-0"]["assetMetadata"]["boundingBox"] = {
+        "x": 3.0, "y": 3.0, "z": 2.0
+    }
+    layout = make_synthetic_layout(4)
+    out, kept = variants.make_biggest_only_layout(task, layout)
+    assert len(out) == 1
+    assert kept == "uid01-0"
+    assert out["uid01-0"] == layout["uid01-0"]
+
+
+def test_biggest_only_empty_layout():
+    out, kept = variants.make_biggest_only_layout({"assets": {}}, {})
+    assert out == {}
+    assert kept is None
+
+
+def test_worst_object_swaps_identity(tmp_path):
+    task = make_synthetic_task(2)
+    layout = make_synthetic_layout(2)
+    # Library: candidates share NO tokens with the query descriptions
+    # ("a synthetic object number N") so they are all worst matches; we just
+    # assert identity actually changes and placements are preserved.
+    lib = [
+        {"category": "rock", "description": "a heavy boulder",
+         "path": "/lib/rock.glb",
+         "assetMetadata": {"boundingBox": {"x": 1, "y": 1, "z": 1}}},
+        {"category": "stick", "description": "a thin twig",
+         "path": "/lib/stick.glb"},
+    ]
+    lib_path = tmp_path / "lib.json"
+    lib_path.write_text(json.dumps(lib))
+    new_layout, new_task, intent = variants.make_worst_object_layout(
+        task, layout, str(lib_path), rank_offset=0
+    )
+    # placements unchanged
+    assert new_layout == layout
+    # asset identity changed for every instance
+    for inst_id in layout:
+        orig = task["assets"][inst_id]
+        new = new_task["assets"][inst_id]
+        assert new["path"] != orig["path"]
+        assert new["path"].startswith("/lib/")
+    assert intent["kind"] == "worst_object"
+    assert not intent["degraded"]
+    assert len(intent["substitutions"]) == 2
+
+
+def test_worst_object_missing_library_raises(tmp_path):
+    task = make_synthetic_task(2)
+    layout = make_synthetic_layout(2)
+    with pytest.raises(FileNotFoundError):
+        variants.make_worst_object_layout(task, layout, str(tmp_path / "nope.json"))
+
+
+def test_generate_named_variants_writes_four(tmp_path):
+    task = make_synthetic_task(6)
+    layout = make_synthetic_layout(6)
+    # build a library so the worst-object variant is produced (not skipped)
+    lib = [{"category": "x", "description": "y", "path": "/lib/x.glb"}]
+    lib_path = tmp_path / "lib.json"
+    lib_path.write_text(json.dumps(lib))
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    written = variants.generate_named_variants(
+        str(run_dir), task, layout, seed=7, asset_library_path=str(lib_path)
+    )
+    names = [os.path.basename(w) for w in written]
+    assert names == [
+        "variant_01_half",
+        "variant_02_biggest-only",
+        "variant_03_scrambled",
+        "variant_04_worst-object",
+    ]
+    for w in written:
+        assert os.path.exists(os.path.join(w, "layout.json"))
+        assert os.path.exists(os.path.join(w, "task.json"))
+    # half keeps round(6/2)=3
+    half = json.load(open(os.path.join(run_dir, names[0], "layout.json")))
+    assert len(half) == 3
+    # biggest-only keeps exactly 1
+    big = json.load(open(os.path.join(run_dir, names[1], "layout.json")))
+    assert len(big) == 1
+
+
+def test_generate_named_variants_skips_worst_without_library(tmp_path):
+    task = make_synthetic_task(4)
+    layout = make_synthetic_layout(4)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    written = variants.generate_named_variants(
+        str(run_dir), task, layout, seed=7, asset_library_path=None
+    )
+    worst = run_dir / "variant_04_worst-object"
+    # no layout.json (skipped), but an intent explains why
+    assert not (worst / "layout.json").exists()
+    intent = json.load(open(worst / "variant_intent.json"))
+    assert intent["degraded"] is True
+
+
+
 def test_subst_with_library_within_and_cross(tmp_path, monkeypatch):
     # Build a tiny library so the scoring/category-filter path executes.
     lib = [
@@ -362,7 +470,7 @@ def test_subst_with_library_within_and_cross(tmp_path, monkeypatch):
     task = make_synthetic_task(2)  # instances are cat0, cat1
     layout = make_synthetic_layout(2)
 
-    _, within = variants.make_category_subst_layout(task, layout, "within")
+    _, within, _ = variants.make_category_subst_layout(task, layout, "within")
     assert within["degraded"] is False
     # uid00-0 is cat0: a within-category candidate (cat0) exists.
     within_for_0 = [
@@ -371,7 +479,7 @@ def test_subst_with_library_within_and_cross(tmp_path, monkeypatch):
     ]
     assert within_for_0 and within_for_0[0]["mode"] == "within"
 
-    _, cross = variants.make_category_subst_layout(task, layout, "cross")
+    _, cross, _ = variants.make_category_subst_layout(task, layout, "cross")
     assert cross["degraded"] is False
     cross_for_0 = [
         s for s in cross["substitutions"]

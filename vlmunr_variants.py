@@ -109,6 +109,152 @@ def make_removal_layout(
 
 
 # ===========================================================================
+# Biggest-only + worst-object selection logic
+# ===========================================================================
+
+
+def _instance_bbox(asset: Dict) -> Tuple[float, float, float]:
+    """Resolve an asset's ``(x, y, z)`` bounding box from either the
+    ``assetMetadata.boundingBox`` (prepared-task) or top-level
+    ``boundingBox`` (raw-task) form.  Missing dimensions default to ``0.0``.
+    """
+
+    bbox = asset.get("assetMetadata", {}).get("boundingBox") or asset.get("boundingBox") or {}
+    try:
+        return (
+            float(bbox.get("x", 0.0) or 0.0),
+            float(bbox.get("y", 0.0) or 0.0),
+            float(bbox.get("z", 0.0) or 0.0),
+        )
+    except (TypeError, ValueError):
+        return (0.0, 0.0, 0.0)
+
+
+def _instance_volume(asset: Dict) -> float:
+    """Bounding-box volume used to rank "biggest" objects."""
+
+    x, y, z = _instance_bbox(asset)
+    return abs(x) * abs(y) * abs(z)
+
+
+def make_biggest_only_layout(
+    task: Dict, layout: Dict
+) -> Tuple[Dict, Optional[str]]:
+    """Keep only the single largest instance (by bounding-box volume).
+
+    Ties are broken by lexicographic instance id so the result is stable
+    regardless of dict ordering.  Returns ``(new_layout, kept_id)`` -- when
+    the layout is empty, ``kept_id`` is ``None`` and the layout is empty.
+    """
+
+    if not layout:
+        return {}, None
+    assets = task.get("assets", {})
+    # (volume, inst_id) -- sort descending by volume, then id for stability.
+    ranked = sorted(
+        layout.keys(),
+        key=lambda i: (-_instance_volume(assets.get(i, {})), i),
+    )
+    kept = ranked[0]
+    return {kept: layout[kept]}, kept
+
+
+def make_worst_object_layout(
+    task: Dict,
+    layout: Dict,
+    asset_library_path: str,
+    rank_offset: int = 0,
+) -> Tuple[Dict, Dict, Dict]:
+    """Fork a generated scene and substitute every instance's asset identity
+    with the *worst-matching* candidate from an asset library.
+
+    This is the "hack the retrieval and pick the worst object instead of the
+    best one" variant: it does **not** re-run the LLM or the gradient solver.
+    It takes the already-generated ``layout`` (placements preserved) and, for
+    each placed instance, swaps the asset record (``path``/``uid``/
+    ``category``/``description``/bounding box) in a *deep-copied* task to the
+    library candidate that matches the original description least well
+    (``rank_offset == 0`` => single worst match; higher offsets move toward
+    better matches).
+
+    Requires ``asset_library_path`` to point at a JSON list of records of the
+    form ``{"category","description","path"[,"assetMetadata":{"boundingBox":...}]}``.
+    Raises ``FileNotFoundError`` when the library is missing -- this variant
+    is meaningless without candidates, so (per the "real paths, no fallback"
+    contract) we fail loudly rather than degrade silently.
+
+    Returns ``(new_layout, new_task, intent)``.
+    """
+
+    intent: Dict = {
+        "kind": "worst_object",
+        "rank_offset": rank_offset,
+        "asset_library": asset_library_path,
+        "substitutions": [],
+        "degraded": False,
+        "reason": "",
+    }
+
+    if not os.path.exists(asset_library_path):
+        raise FileNotFoundError(
+            f"asset library not found: {asset_library_path!r} (required for "
+            "the worst-object variant; pass --asset_library)"
+        )
+    try:
+        with open(asset_library_path) as f:
+            candidates: List[Dict] = json.load(f)
+    except Exception as exc:
+        raise ValueError(f"could not parse asset library {asset_library_path!r}: {exc}") from exc
+    if not candidates:
+        intent["degraded"] = True
+        intent["reason"] = "asset library is empty; scene left unchanged"
+        return dict(layout), dict(task), intent
+
+    cand_texts = [_text_for_asset(c) for c in candidates]
+    import copy as _copy
+    new_task = _copy.deepcopy(task)
+    new_assets = new_task.setdefault("assets", {})
+    assets = task.get("assets", {})
+
+    for inst_id in sorted(layout.keys()):
+        asset = assets.get(inst_id)
+        if asset is None:
+            continue
+        query = _text_for_asset(asset)
+        pick = score_candidates_worst_match(query, cand_texts, rank_offset)
+        if pick is None:
+            continue
+        chosen = candidates[pick]
+        cpath = chosen.get("path")
+        ent = dict(new_assets.get(inst_id, asset))
+        if cpath:
+            ent["path"] = cpath
+            ent["uid"] = os.path.basename(os.path.dirname(cpath)) or ent.get("uid")
+        ent["category"] = chosen.get("category", ent.get("category"))
+        ent["description"] = chosen.get("description", ent.get("description"))
+        # Adopt the candidate's bounding box when the library carries one so
+        # downstream rendering/scaling stays sane; otherwise keep the original.
+        cbbox = (
+            chosen.get("assetMetadata", {}).get("boundingBox")
+            or chosen.get("boundingBox")
+        )
+        if cbbox:
+            ent.setdefault("assetMetadata", {})["boundingBox"] = cbbox
+        new_assets[inst_id] = ent
+        intent["substitutions"].append(
+            {
+                "instance_id": inst_id,
+                "from": query,
+                "to": cand_texts[pick],
+                "candidate_path": cpath,
+            }
+        )
+
+    # Layout placements are unchanged -- only asset identity moved.
+    return dict(layout), new_task, intent
+
+
+# ===========================================================================
 # Layout-scramble logic (unit tested)
 # ===========================================================================
 
@@ -366,9 +512,11 @@ def make_category_subst_layout(
 
     ``mode`` is either ``"within"`` (swap toward a different asset of the
     *same* category) or ``"cross"`` (swap toward an asset of a *different*
-    category).  Returns ``(new_layout, intent)``; placements are preserved
-    (asset identity lives in the task asset map) so ``new_layout`` mirrors
-    ``layout``.
+    category).  Returns ``(new_layout, new_task, intent)`` -- a 3-tuple.
+    Placements are preserved (asset identity lives in the task asset map)
+    so ``new_layout`` mirrors ``layout``; ``new_task`` is a deep-copied task
+    with swapped asset identities when a library is present, else the
+    original task.
 
     The intent's ``substitutions`` is a list of ``{instance_id: mode}`` records
     capturing what the hook decided per instance.  Like the rank-offset hook,
@@ -571,7 +719,120 @@ def generate_variants(scene_dir: str, seed: int = 42) -> List[str]:
     return written
 
 
-def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+# ===========================================================================
+# Named variant set for the text->scene CLI (Q6)
+# ===========================================================================
+
+# The four content variants requested by the generate-scene CLI, written as
+# sub-directories *inside* the run folder (not siblings).
+NAMED_VARIANT_HALF: str = "variant_01_half"
+NAMED_VARIANT_BIGGEST: str = "variant_02_biggest-only"
+NAMED_VARIANT_SCRAMBLE: str = "variant_03_scrambled"
+NAMED_VARIANT_WORST: str = "variant_04_worst-object"
+
+
+def _write_named_variant(
+    run_dir: str,
+    variant_dir: str,
+    task: Dict,
+    new_layout: Dict,
+    intent: Optional[Dict] = None,
+) -> str:
+    """Write one named variant as a sub-directory of ``run_dir``.
+
+    Always names the task copy ``task.json`` so downstream tools can resolve
+    it via ``_resolve_inputs``.
+    """
+
+    out = os.path.join(run_dir, variant_dir)
+    os.makedirs(out, exist_ok=True)
+    with open(os.path.join(out, "layout.json"), "w") as f:
+        json.dump(new_layout, f, indent=2)
+    with open(os.path.join(out, "task.json"), "w") as f:
+        json.dump(task, f, indent=2)
+    if intent is not None:
+        with open(os.path.join(out, "variant_intent.json"), "w") as f:
+            json.dump(intent, f, indent=2)
+    return out
+
+
+def generate_named_variants(
+    run_dir: str,
+    task: Dict,
+    layout: Dict,
+    seed: int = 42,
+    asset_library_path: Optional[str] = None,
+) -> List[str]:
+    """Write the four named content variants as sub-dirs of ``run_dir``.
+
+    * ``variant_01_half``        -- keep round(n/2) instances (seeded).
+    * ``variant_02_biggest-only``-- keep the single largest instance by bbox volume.
+    * ``variant_03_scrambled``   -- relocate every instance within the floor polygon.
+    * ``variant_04_worst-object``-- swap each instance's asset identity to the
+      worst-matching library candidate (placements preserved; no re-solve).
+
+    ``variant_04_worst-object`` requires ``asset_library_path``; if it is
+    ``None`` that variant is skipped with a recorded reason rather than
+    aborting the other three.  Pass a real library path to get all four.
+    """
+
+    written: List[str] = []
+    floor_vertices = (
+        task.get("boundary", {}).get("floor_vertices", []) or []
+    )
+
+    # 01 -- half
+    half = make_removal_layout(layout, 2, seed)
+    written.append(
+        _write_named_variant(run_dir, NAMED_VARIANT_HALF, task, half)
+    )
+
+    # 02 -- biggest only
+    biggest, kept_id = make_biggest_only_layout(task, layout)
+    written.append(
+        _write_named_variant(
+            run_dir, NAMED_VARIANT_BIGGEST, task, biggest,
+            intent={"kind": "biggest_only", "kept_id": kept_id},
+        )
+    )
+
+    # 03 -- scrambled (within the floor region, preserving z/rotation/id)
+    scrambled = scramble_layout(layout, floor_vertices, seed)
+    written.append(
+        _write_named_variant(run_dir, NAMED_VARIANT_SCRAMBLE, task, scrambled)
+    )
+
+    # 04 -- worst-object fork (requires an asset library)
+    if asset_library_path:
+        new_layout, new_task, intent = make_worst_object_layout(
+            task, layout, asset_library_path, rank_offset=0
+        )
+        written.append(
+            _write_named_variant(
+                run_dir, NAMED_VARIANT_WORST, new_task, new_layout, intent
+            )
+        )
+    else:
+        # Record the intent-to-skip so the audit trail is explicit.
+        os.makedirs(os.path.join(run_dir, NAMED_VARIANT_WORST), exist_ok=True)
+        with open(
+            os.path.join(run_dir, NAMED_VARIANT_WORST, "variant_intent.json"), "w"
+        ) as f:
+            json.dump(
+                {
+                    "kind": "worst_object",
+                    "degraded": True,
+                    "reason": (
+                        "no --asset_library provided; worst-object variant "
+                        "requires a real asset library (no synthetic fallback)"
+                    ),
+                },
+                f,
+                indent=2,
+            )
+        written.append(os.path.join(run_dir, NAMED_VARIANT_WORST))
+
+    return written
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--scene-dir", required=True)
     p.add_argument("--seed", type=int, default=42)

@@ -162,8 +162,15 @@ def join_layout_to_assets(
                     description = description or ann.get("description", "")
                 except Exception:
                     pass
-        if not path or not os.path.exists(path):
+        # This is a *data* join: drop an instance only when no path can be
+        # determined at all. We deliberately do NOT require the path to exist
+        # on disk here -- file existence is the renderer's concern, not the
+        # join's, and enforcing it broke the pure-join unit test (synthetic
+        # nonexistent paths were silently dropped). ``asset_dir`` resolution
+        # above already validated any path it supplied.
+        if not path:
             continue
+        bbox = bbox or {}
         position = list(place.get("position", [0, 0, 0]))
         rotation = list(place.get("rotation", [0, 0, 0]))
         records.append(
