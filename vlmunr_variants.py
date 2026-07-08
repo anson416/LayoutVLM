@@ -202,9 +202,24 @@ def make_worst_object_layout(
         )
     try:
         with open(asset_library_path) as f:
-            candidates: List[Dict] = json.load(f)
+            candidates = json.load(f)
     except Exception as exc:
         raise ValueError(f"could not parse asset library {asset_library_path!r}: {exc}") from exc
+    # The library schema is a JSON *list* of records.  Be defensive: a single
+    # record written as a bare object, or a ``{"assets": [...]}`` wrapper, is
+    # coerced to the list form rather than crashing the variant step.
+    if isinstance(candidates, dict):
+        if isinstance(candidates.get("assets"), list):
+            candidates = candidates["assets"]
+        else:
+            candidates = [candidates]
+    if not isinstance(candidates, list):
+        raise ValueError(
+            f"asset library {asset_library_path!r} must be a JSON list of "
+            "records, not a " + type(candidates).__name__
+        )
+    # Drop anything that isn't a record dict so _text_for_asset can't crash.
+    candidates = [c for c in candidates if isinstance(c, dict)]
     if not candidates:
         intent["degraded"] = True
         intent["reason"] = "asset library is empty; scene left unchanged"
@@ -731,31 +746,6 @@ NAMED_VARIANT_SCRAMBLE: str = "variant_03_scrambled"
 NAMED_VARIANT_WORST: str = "variant_04_worst-object"
 
 
-def _write_named_variant(
-    run_dir: str,
-    variant_dir: str,
-    task: Dict,
-    new_layout: Dict,
-    intent: Optional[Dict] = None,
-) -> str:
-    """Write one named variant as a sub-directory of ``run_dir``.
-
-    Always names the task copy ``task.json`` so downstream tools can resolve
-    it via ``_resolve_inputs``.
-    """
-
-    out = os.path.join(run_dir, variant_dir)
-    os.makedirs(out, exist_ok=True)
-    with open(os.path.join(out, "layout.json"), "w") as f:
-        json.dump(new_layout, f, indent=2)
-    with open(os.path.join(out, "task.json"), "w") as f:
-        json.dump(task, f, indent=2)
-    if intent is not None:
-        with open(os.path.join(out, "variant_intent.json"), "w") as f:
-            json.dump(intent, f, indent=2)
-    return out
-
-
 def generate_named_variants(
     run_dir: str,
     task: Dict,
@@ -776,63 +766,96 @@ def generate_named_variants(
     aborting the other three.  Pass a real library path to get all four.
     """
 
+    built = build_named_variants(
+        task, layout, seed=seed, asset_library_path=asset_library_path
+    )
     written: List[str] = []
+    for name, v_task, v_layout, v_intent in built:
+        out = os.path.join(run_dir, name)
+        os.makedirs(out, exist_ok=True)
+        with open(os.path.join(out, "layout.json"), "w") as f:
+            json.dump(v_layout, f, indent=2)
+        with open(os.path.join(out, "task.json"), "w") as f:
+            json.dump(v_task, f, indent=2)
+        if v_intent is not None:
+            with open(os.path.join(out, "variant_intent.json"), "w") as f:
+                json.dump(v_intent, f, indent=2)
+        written.append(out)
+    return written
+
+
+def build_named_variants(
+    task: Dict,
+    layout: Dict,
+    seed: int = 42,
+    asset_library_path: Optional[str] = None,
+) -> List[Tuple[str, Dict, Dict, Optional[Dict]]]:
+    """Build the four named variants *in memory* (no disk writes).
+
+    Returns a list of ``(name, new_task, new_layout, intent)`` tuples in a
+    fixed order:
+      ``variant_01_half``, ``variant_02_biggest-only``,
+      ``variant_03_scrambled``, ``variant_04_worst-object``.
+
+    Each entry's ``new_task`` is the task to persist for that variant (the
+    worst-object variant deep-copies and swaps asset identities; the others
+    reuse the input task).  ``new_layout`` is the forked layout (placements
+    only; never re-solved).  ``intent`` records what the variant did (or, for
+    the worst-object variant without a library, why it was degraded).
+
+    ``variant_04_worst-object`` requires ``asset_library_path``; without it,
+    that variant is emitted with the *original* layout/task and a degraded
+    intent (rather than raising), so callers can still persist a folder with
+    an explanatory ``variant_intent.json``.
+    """
+
+    built: List[Tuple[str, Dict, Dict, Optional[Dict]]] = []
     floor_vertices = (
         task.get("boundary", {}).get("floor_vertices", []) or []
     )
 
     # 01 -- half
     half = make_removal_layout(layout, 2, seed)
-    written.append(
-        _write_named_variant(run_dir, NAMED_VARIANT_HALF, task, half)
-    )
+    built.append((NAMED_VARIANT_HALF, task, half, None))
 
     # 02 -- biggest only
     biggest, kept_id = make_biggest_only_layout(task, layout)
-    written.append(
-        _write_named_variant(
-            run_dir, NAMED_VARIANT_BIGGEST, task, biggest,
-            intent={"kind": "biggest_only", "kept_id": kept_id},
-        )
+    built.append(
+        (NAMED_VARIANT_BIGGEST, task, biggest,
+         {"kind": "biggest_only", "kept_id": kept_id})
     )
 
     # 03 -- scrambled (within the floor region, preserving z/rotation/id)
     scrambled = scramble_layout(layout, floor_vertices, seed)
-    written.append(
-        _write_named_variant(run_dir, NAMED_VARIANT_SCRAMBLE, task, scrambled)
-    )
+    built.append((NAMED_VARIANT_SCRAMBLE, task, scrambled, None))
 
     # 04 -- worst-object fork (requires an asset library)
     if asset_library_path:
         new_layout, new_task, intent = make_worst_object_layout(
             task, layout, asset_library_path, rank_offset=0
         )
-        written.append(
-            _write_named_variant(
-                run_dir, NAMED_VARIANT_WORST, new_task, new_layout, intent
-            )
-        )
+        built.append((NAMED_VARIANT_WORST, new_task, new_layout, intent))
     else:
-        # Record the intent-to-skip so the audit trail is explicit.
-        os.makedirs(os.path.join(run_dir, NAMED_VARIANT_WORST), exist_ok=True)
-        with open(
-            os.path.join(run_dir, NAMED_VARIANT_WORST, "variant_intent.json"), "w"
-        ) as f:
-            json.dump(
-                {
-                    "kind": "worst_object",
-                    "degraded": True,
-                    "reason": (
-                        "no --asset_library provided; worst-object variant "
-                        "requires a real asset library (no synthetic fallback)"
-                    ),
-                },
-                f,
-                indent=2,
-            )
-        written.append(os.path.join(run_dir, NAMED_VARIANT_WORST))
+        # Emit a degraded entry so the caller can persist an explanatory
+        # intent without a swapped layout (real-paths, no synthetic fallback).
+        intent = {
+            "kind": "worst_object",
+            "degraded": True,
+            "reason": (
+                "no --asset_library provided; worst-object variant requires "
+                "a real asset library (no synthetic fallback)"
+            ),
+        }
+        built.append((NAMED_VARIANT_WORST, task, layout, intent))
 
-    return written
+    return built
+
+
+# ===========================================================================
+# CLI (legacy sibling-variant generator)
+# ===========================================================================
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--scene-dir", required=True)
     p.add_argument("--seed", type=int, default=42)

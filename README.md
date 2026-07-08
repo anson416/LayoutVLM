@@ -80,9 +80,31 @@ python cli.py \
     --variants
 ```
 
-Each run folder contains `config.json` (prompt + LLM config; the API key is
-stored **redacted** only), `scene_spec.json`, `prepared_task.json`, and the
-base `layout.json`.
+Each run is a folder `outputs/<YYYYMMDD-HHMMSS UTC>/` containing `config.json`
+(prompt + LLM config; the API key is stored **redacted** only) and a `base/`
+sub-folder holding the generated scene:
+
+```
+outputs/<timestamp>/
+  config.json
+  base/
+    task.json         # resolved + normalized task the solver/renderer consume
+    layout.json       # placed instances (the scene)
+    scene_spec.json   # the LLM-produced scene spec (boundary + asset list)
+    meshes/           # the GLB meshes referenced by the scene, copied in
+    renderings/       # only with --render (and bpy); always named "renderings"
+    solve_run/        # real mode only: per-group solver artifacts
+  variant_01_half/
+  variant_02_biggest-only/
+  variant_03_scrambled/
+  variant_04_worst-object/
+```
+
+Every scene folder (`base/` and each variant) has the **same** internal
+structure (`task.json`, `layout.json`, `meshes/`, and `renderings/` when
+rendered), so each is independently renderable and portable — the referenced
+meshes are copied into `meshes/` and the task paths rewritten to `./meshes/…`,
+so a folder no longer depends on the external `--asset_dir`.
 
 * `--variants` also writes four content variants as sub-directories, **without
   re-running the LLM or solver** (they fork the base layout):
@@ -95,6 +117,11 @@ base `layout.json`.
 * `--mock` skips the LLM + gradient solver and places assets at random floor
   points, so the whole pipeline + variants are exercisable offline without
   GPU/Blender or API cost.
+* `--render` renders each scene (base + variants) into its own `renderings/`
+  sub-folder via `vlmunr_render`. Requires bpy + HDRIs; degrades gracefully
+  (skips rendering, keeps the scene + meshes) if bpy is unavailable or an
+  asset mesh is missing. `--render_phase` selects the render phase (default
+  `1a` = one image per resolution at the baseline yaw/pitch/hdri).
 * `--asset_library path.json` — JSON list of
   `{"category","description","path"[,"assetMetadata":{"boundingBox":...}]}`,
   required for the worst-object variant.

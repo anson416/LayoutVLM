@@ -145,27 +145,43 @@ Offline demonstration (no LLM / no solver / no bpy; uses placeholder assets):
 OUTPUT
 ------
 Everything is written under outputs/<YYYYMMDD-HHMMSS UTC>/:
-  config.json          prompt + LLM config (api key stored REDACTED only)
-  scene_spec.json      the LLM-produced scene spec (boundary + asset list)
-  prepared_task.json   resolved + normalized task the solver consumes
-  layout.json          the BASE scene (placed instances)
-  solve_run/           (real mode only) per-group solver artifacts
-  variant_01_half/           keep round(n/2) instances (seeded)
-  variant_02_biggest-only/   keep the single largest instance (bbox volume)
-  variant_03_scrambled/      relocate every instance within the floor polygon
+
+  config.json                 prompt + LLM config (api key stored REDACTED only)
+  base/                       the BASE scene (the generated layout)
+      task.json               resolved + normalized task the solver consumes
+      layout.json             placed instances (the scene)
+      scene_spec.json         the LLM-produced scene spec (boundary + asset list)
+      meshes/                 the GLB meshes referenced by the scene, copied in
+                              so the folder is self-contained (no external
+                              asset_dir needed to view/render it)
+      renderings/             (only with --render) PNG renders of this scene
+      solve_run/              (real mode only) per-group solver artifacts
+  variant_01_half/            keep round(n/2) instances (seeded)
+  variant_02_biggest-only/    keep the single largest instance (bbox volume)
+  variant_03_scrambled/       relocate every instance within the floor polygon
   variant_04_worst-object/    swap asset identity to worst-match library cand
-                             (only when --asset_library is given)
-None of the variants re-run the LLM or the gradient solver; they fork layout.json.
+                              (only when --asset_library is given)
+
+Each variant directory has the SAME internal structure as base/ (task.json,
+layout.json, meshes/, and renderings/ when --render is set), so every scene --
+base or variant -- is independently renderable and portable. None of the
+variants re-run the LLM or the gradient solver; they fork the base layout.
+
+The renderings sub-folder is ALWAYS named "renderings" (the renderer writes
+there); it is only created when there are actually renders to write (i.e. when
+--render is passed and bpy is available), so an absent renderings/ folder means
+"not rendered", never an error.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy as _copy
 import datetime
 import json
 import os
 import sys
-from typing import List
+from typing import Dict, List, Optional
 
 # Make repo root importable when run as a script.
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -236,6 +252,14 @@ def parse_args(argv: List[str] = None) -> argparse.Namespace:
     # --- behavior flags ---
     p.add_argument("--variants", action="store_true",
                    help="Also write the 4 named content variants.")
+    p.add_argument("--render", action="store_true",
+                   help="Render each scene (base + variants) into its own "
+                        "renderings/ sub-folder. Requires bpy + HDRIs; "
+                        "degrades gracefully (skips rendering, keeps the rest) "
+                        "if bpy is unavailable or an asset mesh is missing.")
+    p.add_argument("--render_phase", default="1a",
+                   help="Render phase (vlmunr_render/vlmunr_config). '1a' = one "
+                        "image per resolution at the baseline yaw/pitch/hdri.")
     p.add_argument("--mock", action="store_true",
                    help="Skip the LLM + gradient solver; produce a random "
                         "placement layout so the pipeline + variants run "
@@ -311,6 +335,132 @@ def _check_external_resources(args, *, mock: bool) -> List[str]:
     return warnings
 
 
+def _make_self_contained(
+    task: dict,
+    layout: dict,
+    scene_dir: str,
+    *,
+    scene_spec_dict: Optional[dict] = None,
+    solve_run_dir: Optional[str] = None,
+) -> dict:
+    """Write one scene (base or variant) as a self-contained sub-folder.
+
+    Layout::
+
+        <scene_dir>/
+            task.json          the task the solver/renderer consume
+            layout.json        placed instances
+            scene_spec.json    (only when scene_spec_dict is given; base only)
+            meshes/            GLB meshes referenced by the scene, copied in
+            solve_run/         (only when solve_run_dir is given; base only)
+
+    Each referenced GLB (``asset.path``) is copied into ``meshes/`` with a
+    unique flat name, and the saved task's paths are rewritten to
+    ``./meshes/<name>`` so the folder is portable -- it carries every mesh it
+    needs and no longer depends on the external ``--asset_dir``.  Meshes that
+    do not exist on disk are skipped (with a warning); the asset entry keeps
+    its original path so the renderer can decide what to do.  The returned
+    task is the rewritten copy (also what gets written to task.json).
+    """
+
+    import shutil
+
+    os.makedirs(scene_dir, exist_ok=True)
+    meshes_dir = os.path.join(scene_dir, "meshes")
+
+    # Deduplicate copies by source path so a mesh shared across instances is
+    # written once.
+    seen: Dict[str, str] = {}
+    out_task = _copy.deepcopy(task)
+    for inst_id, asset in out_task.get("assets", {}).items():
+        src = asset.get("path")
+        if not src or not os.path.exists(src):
+            if src:
+                print(f"      WARN: mesh not found, not copied: {src} "
+                      f"({inst_id})")
+            continue
+        if src in seen:
+            asset["path"] = seen[src]
+            continue
+        ext = os.path.splitext(src)[1] or ".glb"
+        flat = f"{inst_id}{ext}"
+        # Disambiguate against unlikely collisions across instances.
+        dst_name = flat
+        i = 1
+        while os.path.exists(os.path.join(meshes_dir, dst_name)) and \
+                seen.get(src) != f"./meshes/{dst_name}":
+            # Only rename if the existing file came from a *different* source.
+            i += 1
+            dst_name = f"{inst_id}_{i}{ext}"
+        os.makedirs(meshes_dir, exist_ok=True)
+        try:
+            shutil.copy2(src, os.path.join(meshes_dir, dst_name))
+        except Exception as exc:  # pragma: no cover - filesystem dependent
+            print(f"      WARN: could not copy mesh {src} ({exc})")
+            continue
+        rel = f"./meshes/{dst_name}"
+        seen[src] = rel
+        asset["path"] = rel
+
+    with open(os.path.join(scene_dir, "task.json"), "w") as f:
+        json.dump(out_task, f, indent=2, default=_json_default)
+    with open(os.path.join(scene_dir, "layout.json"), "w") as f:
+        json.dump(layout, f, indent=2, default=_json_default)
+    if scene_spec_dict is not None:
+        with open(os.path.join(scene_dir, "scene_spec.json"), "w") as f:
+            json.dump(scene_spec_dict, f, indent=2, default=_json_default)
+    if solve_run_dir and os.path.isdir(solve_run_dir):
+        # Move the solver's scratch dir into the base scene folder.
+        dst = os.path.join(scene_dir, "solve_run")
+        if os.path.abspath(solve_run_dir) != os.path.abspath(dst):
+            try:
+                shutil.move(solve_run_dir, dst)
+            except Exception:
+                pass
+    return out_task
+
+
+def _maybe_render(
+    task: dict, layout: dict, scene_dir: str, args, reason: str
+) -> List[str]:
+    """Render one scene into ``<scene_dir>/renderings/`` when ``--render``.
+
+    The renderings folder is ALWAYS named ``renderings`` (the vlmunr_render
+    renderer writes there); it is only created when there are actually renders
+    to write.  Rendering is optional and best-effort: any failure (no bpy, a
+    missing mesh, an HDRI problem) is logged and skipped so the rest of the
+    pipeline still completes.  Returns the list of PNG paths written (empty
+    when not rendering or on failure).
+    """
+
+    if not args.render:
+        return []
+    try:
+        import vlmunr_render as _render  # noqa: WPS433 (lazy: pulls in bpy)
+    except Exception as exc:  # pragma: no cover - env dependent
+        print(f"      WARN: could not import vlmunr_render ({exc}); "
+              f"skipping rendering for {reason}.")
+        return []
+    try:
+        # resolve_asset paths inside the self-contained folder are relative
+        # ("./meshes/..."); the renderer resolves them against CWD, so chdir
+        # into the scene folder for the duration of the render.
+        prev_cwd = os.getcwd()
+        os.chdir(scene_dir)
+        try:
+            written = _render.render_phase(
+                task, layout, scene_dir, args.render_phase,
+                env_strength=1.0, asset_dir=None,
+            )
+        finally:
+            os.chdir(prev_cwd)
+        return written
+    except Exception as exc:  # pragma: no cover - rendering is best-effort
+        print(f"      WARN: rendering failed for {reason} ({exc}); "
+              "scene + meshes still saved.")
+        return []
+
+
 def main(argv: List[str] = None) -> int:
     args = parse_args(argv)
 
@@ -358,24 +508,25 @@ def main(argv: List[str] = None) -> int:
     with open(os.path.join(run_dir, "config.json"), "w") as f:
         json.dump(config, f, indent=2)
 
+    # Step count varies with --variants, so the [i/N] labels are computed.
+    _n_steps = 4 if args.variants else 3
+
     # --- 1. text -> scene spec ---
     if args.mock:
-        print("[1/4] mock mode: building scene spec offline (no LLM).")
+        print("[1/%d] mock mode: building scene spec offline (no LLM)." % _n_steps)
         spec = scene_spec.mock_scene_spec(args.prompt)
     else:
-        print("[1/4] generating scene spec from prompt via LLM ...")
+        print("[1/%d] generating scene spec from prompt via LLM ..." % _n_steps)
         spec = scene_spec.generate_scene_spec(
             args.prompt,
             model=args.model, base_url=args.base_url, api_key=args.api_key,
             temperature=args.temperature,
         )
-    with open(os.path.join(run_dir, "scene_spec.json"), "w") as f:
-        json.dump(spec, f, indent=2)
     print(f"      spec: {len(spec.get('asset_spec', []))} asset request(s), "
           f"{len(spec['boundary']['floor_vertices'])} floor verts.")
 
     # --- 2. resolve spec -> raw task, then normalize ---
-    print("[2/4] resolving asset requests against asset_dir ...")
+    print("[2/%d] resolving asset requests against asset_dir ..." % _n_steps)
     task, warnings = scene_spec.resolve_asset_spec(spec, args.asset_dir)
     for w in warnings:
         print(f"      WARN: {w}")
@@ -388,22 +539,23 @@ def main(argv: List[str] = None) -> int:
     # prepare_task_assets reloads metadata from <asset_dir>/<uid>/data.json
     # and produces the prepared-task shape the solver/render expect.
     task = prepare_task_assets(task, args.asset_dir)
-    with open(os.path.join(run_dir, "prepared_task.json"), "w") as f:
-        json.dump(task, f, indent=2)
 
     # --- 3. generate the base layout ---
     if args.mock:
-        print("[3/4] mock mode: placing assets at random floor points (no solver).")
+        print("[3/%d] mock mode: placing assets at random floor points "
+              "(no solver)." % _n_steps)
         layout = _mock_layout(task)
     else:
-        print("[3/4] generating base scene via LayoutVLM.solve (LLM + solver) ...")
-        from src.layoutvlm.layoutvlm import LayoutVLM  # lazy: pulls in bpy + torch
-        # Expose hdri_dir to the renderer via env (load_hdri resolves a path;
-        # the existing vendored dir is the default the code expects).
+        print("[3/%d] generating base scene via LayoutVLM.solve "
+              "(LLM + solver) ..." % _n_steps)
+        from src.layoutvlm.layoutvlm import LayoutVLM  # lazy: bpy + torch
+        # The solver writes scratch into base/solve_run; _make_self_contained
+        # relocates it into the base scene folder below.
+        solve_run_dir = os.path.join(run_dir, "solve_run")
         os.environ.setdefault("VLMUNR_HDRI_DIR", args.hdri_dir)
         solver = LayoutVLM(
             mode="one_shot",
-            save_dir=os.path.join(run_dir, "solve_run"),
+            save_dir=solve_run_dir,
             asset_source="objaverse",
             model=args.model,
             base_url=args.base_url,
@@ -411,22 +563,45 @@ def main(argv: List[str] = None) -> int:
             temperature=args.temperature,
         )
         layout = solver.solve(task)
-    with open(os.path.join(run_dir, "layout.json"), "w") as f:
-        json.dump(layout, f, indent=2, default=_json_default)
     print(f"      base scene: {len(layout)} placed instance(s).")
+
+    # --- write the BASE scene as a self-contained sub-folder ---
+    print(f"      writing base scene -> base/")
+    base_dir = os.path.join(run_dir, "base")
+    solve_run_dir = (
+        os.path.join(run_dir, "solve_run")
+        if not args.mock and os.path.isdir(os.path.join(run_dir, "solve_run"))
+        else None
+    )
+    base_task = _make_self_contained(
+        task, layout, base_dir,
+        scene_spec_dict=spec, solve_run_dir=solve_run_dir,
+    )
+    _render_count = _maybe_render(base_task, layout, base_dir, args, "base")
+    if _render_count:
+        print(f"      rendered {len(_render_count)} image(s) -> base/renderings")
 
     # --- 4. variants (Q2-Q5), no re-solve ---
     if args.variants:
-        print("[4/4] writing named variants (no LLM / no solver) ...")
-        written = variants.generate_named_variants(
-            run_dir, task, layout,
+        print("[4/%d] writing named variants (no LLM / no solver) ..."
+              % _n_steps)
+        var_layouts = variants.build_named_variants(
+            task, layout,
             seed=args.seed,
             asset_library_path=args.asset_library,
         )
-        for w in written:
-            print(f"      - {os.path.relpath(w, run_dir)}")
+        for name, v_task, v_layout, v_intent in var_layouts:
+            v_dir = os.path.join(run_dir, name)
+            v_task = _make_self_contained(v_task, v_layout, v_dir)
+            if v_intent is not None:
+                with open(os.path.join(v_dir, "variant_intent.json"), "w") as f:
+                    json.dump(v_intent, f, indent=2, default=_json_default)
+            rc_imgs = _maybe_render(v_task, v_layout, v_dir, args, name)
+            extra = (f"; rendered {len(rc_imgs)} image(s)"
+                     if rc_imgs else "")
+            print(f"      - {name}{extra}")
     else:
-        print("[4/4] --variants not set; skipping variant generation.")
+        print("      --variants not set; skipping variant generation.")
 
     print(f"\nDone. Run folder: {run_dir}")
     return 0

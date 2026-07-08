@@ -440,6 +440,26 @@ def test_generate_named_variants_writes_four(tmp_path):
     assert len(big) == 1
 
 
+def test_build_named_variants_in_memory():
+    task = make_synthetic_task(4)
+    layout = make_synthetic_layout(4)
+    built = variants.build_named_variants(task, layout, seed=7)
+    assert [name for name, _, _, _ in built] == [
+        "variant_01_half",
+        "variant_02_biggest-only",
+        "variant_03_scrambled",
+        "variant_04_worst-object",
+    ]
+    # half keeps round(4/2)=2
+    assert len(built[0][2]) == 2
+    # biggest-only keeps exactly 1
+    assert len(built[1][2]) == 1
+    # worst-object without a library: degraded intent, original layout kept
+    assert built[3][3]["degraded"] is True
+    assert built[3][2] == layout
+    assert built[3][1] is task
+
+
 def test_generate_named_variants_skips_worst_without_library(tmp_path):
     task = make_synthetic_task(4)
     layout = make_synthetic_layout(4)
@@ -449,8 +469,9 @@ def test_generate_named_variants_skips_worst_without_library(tmp_path):
         str(run_dir), task, layout, seed=7, asset_library_path=None
     )
     worst = run_dir / "variant_04_worst-object"
-    # no layout.json (skipped), but an intent explains why
-    assert not (worst / "layout.json").exists()
+    # layout.json is still written (degraded entry keeps the original layout),
+    # but the variant_intent records why the swap did not happen.
+    assert (worst / "layout.json").exists()
     intent = json.load(open(worst / "variant_intent.json"))
     assert intent["degraded"] is True
 
@@ -644,6 +665,10 @@ def test_cli_mock_mode_end_to_end(tmp_path):
          "path": str(tmp_path / "boulder.glb"),
          "assetMetadata": {"boundingBox": {"x": 2, "y": 2, "z": 2}}},
     ]))
+    # Make the library candidate mesh exist on disk so the worst-object
+    # variant's copy-into-meshes step actually copies it. Distinct content
+    # lets us verify the *swapped* mesh (not a leftover base mesh) was copied.
+    (tmp_path / "boulder.glb").write_text("boulder-mesh-bytes")
     out_root = tmp_path / "outputs"
 
     rc = cli.main([
@@ -662,7 +687,7 @@ def test_cli_mock_mode_end_to_end(tmp_path):
     # run folder name is YYYYMMDD-HHMMSS in UTC
     assert len(runs[0]) == 15 and runs[0][8] == "-"
 
-    # config + base layout + prepared task present; api key redacted
+    # config.json at the run-folder root; api key redacted only.
     cfg = json.load(open(run / "config.json"))
     assert cfg["prompt"] == "a cozy bedroom with a bed and a chair"
     assert cfg["mock"] is True
@@ -670,20 +695,45 @@ def test_cli_mock_mode_end_to_end(tmp_path):
     assert cfg["api_key_redacted"].startswith("sk-t")
     assert "7890" in cfg["api_key_redacted"]
     assert "sk-test1234567890" not in json.dumps(cfg)
-    assert os.path.exists(run / "layout.json")
-    assert os.path.exists(run / "prepared_task.json")
 
-    # the four named variants exist with layout.json
+    # BASE scene lives in base/ and is self-contained.
+    base = run / "base"
+    assert base.is_dir()
+    assert os.path.exists(base / "layout.json")
+    assert os.path.exists(base / "task.json")
+    assert os.path.exists(base / "scene_spec.json")
+    assert (base / "meshes").is_dir()
+    # meshes/ holds a copy of every referenced asset; in --mock the prepared
+    # task carries the real <asset_dir>/<uid>/<uid>.glb path -> copied in.
+    assert any(p.endswith(".glb") for p in os.listdir(base / "meshes"))
+    # the saved task's asset paths point at the local meshes/, not the
+    # external asset_dir, so the folder is portable.
+    base_task = json.load(open(base / "task.json"))
+    for ent in base_task["assets"].values():
+        if ent.get("path"):
+            assert ent["path"].startswith("./meshes/")
+
+    # the four named variants exist as sub-dirs with the same structure.
     for name in ["variant_01_half", "variant_02_biggest-only",
                  "variant_03_scrambled", "variant_04_worst-object"]:
         v = run / name
         assert v.is_dir(), name
         assert os.path.exists(v / "layout.json"), name
+        assert os.path.exists(v / "task.json"), name
+        assert (v / "meshes").is_dir(), name
 
     # worst-object variant swapped the asset identity to the library candidate
+    # and copied its mesh into the variant's meshes/ (deduped to one file).
     worst_task = json.load(open(run / "variant_04_worst-object" / "task.json"))
     for ent in worst_task["assets"].values():
-        assert "boulder" in ent["path"]
+        assert ent["path"].startswith("./meshes/")
+    worst_meshes = os.listdir(run / "variant_04_worst-object" / "meshes")
+    # the single copied mesh is the library candidate (distinct content).
+    copied = [
+        (run / "variant_04_worst-object" / "meshes" / p).read_text()
+        for p in worst_meshes
+    ]
+    assert "boulder-mesh-bytes" in copied
 
 
 def test_cli_missing_api_key_errors(tmp_path):
