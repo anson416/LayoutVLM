@@ -2,19 +2,28 @@
 
 This module joins a LayoutVLM ``layout.json`` (instance id -> position/rotation)
 back to its input task JSON (asset paths, bounding boxes, boundary), builds the
-scene in Blender honoring the LayoutVLM coordinate convention, and sweeps the
-requested audit phase, writing PNGs into ``<scene-dir>/renderings/``.
+scene in Blender honoring the LayoutVLM coordinate convention, then renders a
+set of *render specs* (each = one transparent master + its bg composites),
+writing PNGs into ``<scene-dir>/renderings/``.
 
-Rendering uses a two-phase strategy:
+Rendering strategy (per the ``bpa.py`` convention the harness requires):
 
-1. A transparent *master* render is produced once per
-   ``(res, focal, pitch, yaw, hdri)`` combination::
+1. For each ``(res, focal, pitch, yaw, env)`` master, render ONCE with a
+   **transparent** background (env-map lighting still applied)::
 
-       render_{res}_{focal}_{pitch}_{yaw}_{hdri}.png
+       render_res-<res>_focal-<focal>_pitch-<pitch>_yaw-<yaw>_env-<env>.png
 
-2. Each requested background gray is composited onto the master to produce::
+2. Composite each requested background color directly onto the transparent
+   master to produce::
 
-       render_{res}_{focal}_{r}_{g}_{b}_{pitch}_{yaw}_{hdri}.png
+       render_res-<res>_focal-<focal>_pitch-<pitch>_yaw-<yaw>_env-<env>_bg-<r>-<g>-<b>.png
+
+3. ``fit_ratio=1`` (tight-fit) -- the object's projection fills the viewport
+   with no unnecessary empty space.
+
+``pitch`` follows the bpa convention where 0 == top-down; the filename always
+carries the literal pitch value used (so filenames are consistent across
+methods even if a peer method calls top-down "90").
 
 The scene-loading and filename logic is factored into pure functions so it can
 be unit-tested without ``bpy`` installed.  ``bpy``/``vlmunr_bpa`` are imported
@@ -36,12 +45,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import vlmunr_config as cfg
 
 # -90 degree pre-rotation about Z applied to every preprocessed mesh.
 PREROTATION_Z_DEG: float = -90.0
+
+# Tight-fit: the object projection fills the viewport (per the bpa convention
+# the harness mandates).  1.0 == tight-fit, 0.0 == bounding-sphere.
+DEFAULT_FIT_RATIO: float = 1.0
 
 
 # ===========================================================================
@@ -50,11 +63,11 @@ PREROTATION_Z_DEG: float = -90.0
 
 
 def master_filename(
-    res: int, focal: int, pitch: int, yaw: int, hdri: str
+    res: int, focal: int, pitch: int, yaw: int, env: str
 ) -> str:
     """Filename for a transparent master render."""
 
-    return f"render_{res}_{focal}_{pitch}_{yaw}_{hdri}.png"
+    return f"render_res-{res}_focal-{focal}_pitch-{pitch}_yaw-{yaw}_env-{env}.png"
 
 
 def composite_filename(
@@ -63,12 +76,15 @@ def composite_filename(
     bg: Tuple[int, int, int],
     pitch: int,
     yaw: int,
-    hdri: str,
+    env: str,
 ) -> str:
     """Filename for a background-composited render."""
 
     r, g, b = bg
-    return f"render_{res}_{focal}_{r}_{g}_{b}_{pitch}_{yaw}_{hdri}.png"
+    return (
+        f"render_res-{res}_focal-{focal}_pitch-{pitch}_yaw-{yaw}_env-{env}"
+        f"_bg-{r}-{g}-{b}.png"
+    )
 
 
 def resolve_scene_paths(
@@ -262,13 +278,48 @@ def _as_rgb(bg) -> Tuple[int, int, int]:
     return (int(bg), int(bg), int(bg))
 
 
-def enumerate_renders(phase: str) -> List[Dict]:
-    """Expand a phase into a list of render specs (pure, no bpy).
+def merge_specs(specs: Iterable[Dict]) -> List[Dict]:
+    """Merge specs that share a master, unioning their backgrounds.
 
-    Each spec is a dict with ``res, focal, pitch, yaw, hdri`` and a list of
-    background ``(r, g, b)`` tuples ``bgs`` (gray levels are expanded to equal
-    channels; chromatic phases pass their tuples through).  One spec == one
-    master render plus its composites.
+    A master is identified by ``(res, focal, pitch, yaw, env)``.  When several
+    specs share a master (e.g. the baseline point 512/50/0/0/city appears in
+    the resolution, focal, pitch, env and background sweeps), the renderer must
+    render that transparent master ONCE and composite the UNION of all its
+    requested backgrounds onto it.  This returns one merged spec per unique
+    master, preserving first-seen order and de-duplicating backgrounds.
+    """
+
+    merged: Dict[Tuple, Dict] = {}
+    order: List[Tuple] = []
+    for s in specs:
+        env = s.get("env", s.get("hdri"))
+        key = (s["res"], s["focal"], s["pitch"], s["yaw"], env)
+        if key not in merged:
+            merged[key] = {
+                "res": s["res"],
+                "focal": s["focal"],
+                "pitch": s["pitch"],
+                "yaw": s["yaw"],
+                "env": env,
+                "hdri": env,
+                "bgs": [],
+            }
+            order.append(key)
+        for bg in s.get("bgs", []):
+            rgb = _as_rgb(bg)
+            if rgb not in merged[key]["bgs"]:
+                merged[key]["bgs"].append(rgb)
+    return [merged[k] for k in order]
+
+
+def enumerate_renders(phase: str) -> List[Dict]:
+    """Expand a legacy phase into a list of render specs (pure, no bpy).
+
+    Each spec is a dict with ``res, focal, pitch, yaw, env`` (=hdri) and a list
+    of background ``(r, g, b)`` tuples ``bgs``.  One spec == one master render
+    plus its composites.  Kept as a building block for the module CLI and for
+    single-axis tests; ``cli.py`` uses ``cfg.single_render_spec`` /
+    ``cfg.all_sweep_specs`` instead.
     """
 
     levels = cfg.phase_levels(phase)
@@ -285,6 +336,7 @@ def enumerate_renders(phase: str) -> List[Dict]:
                                 "focal": focal,
                                 "pitch": pitch,
                                 "yaw": yaw,
+                                "env": hdri,
                                 "hdri": hdri,
                                 "bgs": bgs,
                             }
@@ -355,9 +407,16 @@ def load_scene_into_blender(task: Dict, layout: Dict, asset_dir: str = None):
     return imported
 
 
-def _hdri_path(hdri: str) -> str:
-    here = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(here, "vlmunr_hdri", f"{hdri}.exr")
+def _hdri_path(env: str, hdri_dir: Optional[str] = None) -> str:
+    """Resolve an env-map name to its .exr path.
+
+    ``hdri_dir`` overrides the vendored default; the CLI passes its
+    ``--hdri_dir`` through.  The vendored HDRIs ship under ``vlmunr_hdri/``
+    next to this module.
+    """
+
+    base = hdri_dir or os.path.join(os.path.dirname(os.path.abspath(__file__)), "vlmunr_hdri")
+    return os.path.join(base, f"{env}.exr")
 
 
 def _build_lvlm_shell(task):
@@ -383,17 +442,29 @@ def _build_lvlm_shell(task):
         return []
 
 
-
-def render_phase(
+def render_specs(
     task: Dict,
     layout: Dict,
     scene_dir: str,
-    phase: str,
+    specs: List[Dict],
     *,
     env_strength: float = 1.0,
     asset_dir: str = None,
+    hdri_dir: Optional[str] = None,
+    fit_ratio: float = DEFAULT_FIT_RATIO,
 ) -> List[str]:
-    """Render every spec in *phase*, returning the list of PNG paths written."""
+    """Render every (merged) spec, returning the list of PNG paths written.
+
+    Each spec is ``{res, focal, pitch, yaw, env, bgs}`` (``bgs`` = list of
+    ``(r, g, b)`` backgrounds to composite onto that master).  Specs sharing a
+    master are merged so the transparent master is rendered once and the union
+    of its backgrounds composited onto it.
+
+    Pipeline per unique env: load geometry, build the room shell, then set the
+    env-map world (geometry is loaded FIRST because ``bpa.clear`` wipes the
+    world).  For each master: dollhouse-cull the walls for this camera pose,
+    render the transparent master at ``fit_ratio``, then composite each bg.
+    """
 
     import vlmunr_bpa as bpa
     from mathutils import Vector
@@ -401,32 +472,34 @@ def render_phase(
     out_dir = os.path.join(scene_dir, "renderings")
     os.makedirs(out_dir, exist_ok=True)
 
+    merged = merge_specs(specs)
+    if not merged:
+        return []
+
     center, radius = compute_scene_center_radius(task)
     center = Vector(center)
-    specs = enumerate_renders(phase)
 
     written: List[str] = []
-    current_hdri: Optional[str] = None
-    scene_loaded = False
-
-    # Group by hdri so we only re-initialize (and reload the scene) on change.
-    for hdri in sorted({s["hdri"] for s in specs}):
-        env = _hdri_path(hdri)
-        if not os.path.exists(env):
-            raise FileNotFoundError(f"HDRI not found: {env}")
+    # Group by env so the scene is reloaded only when the env map changes.
+    for env in sorted({s["env"] for s in merged}):
+        env_path = _hdri_path(env, hdri_dir)
+        if not os.path.exists(env_path):
+            raise FileNotFoundError(f"HDRI not found: {env_path}")
         # Load geometry FIRST: load_scene_into_blender calls bpa.clear() which
-        # wipes bpy.data.worlds, so the HDRI world must be set AFTER it or the
+        # wipes bpy.data.worlds, so the env world must be set AFTER it or the
         # scene renders unlit/black.
         load_scene_into_blender(task, layout, asset_dir)
-        # VLMUNR_PATCH room shell
-        _VLMUNR_WALLS = _build_lvlm_shell(task)
-        bpa.initialize(transparent=True, environment_map=(env, env_strength))
-        current_hdri = hdri
-        scene_loaded = True
+        walls = _build_lvlm_shell(task)
+        bpa.initialize(transparent=True, environment_map=(env_path, env_strength))
 
-        for spec in specs:
-            if spec["hdri"] != current_hdri:
+        for spec in merged:
+            if spec["env"] != env:
                 continue
+            try:
+                import vlmunr_shell as _vs
+                _vs.cull_walls(walls, spec["pitch"], spec["yaw"])
+            except Exception:
+                pass
             master = os.path.join(
                 out_dir,
                 master_filename(
@@ -434,14 +507,9 @@ def render_phase(
                     spec["focal"],
                     spec["pitch"],
                     spec["yaw"],
-                    spec["hdri"],
+                    spec["env"],
                 ),
             )
-            try:
-                import vlmunr_shell as _vs
-                _vs.cull_walls(_VLMUNR_WALLS, spec["pitch"], spec["yaw"])
-            except Exception:
-                pass
             renderer = bpa.Renderer()
             renderer.render_perspective(
                 master,
@@ -450,7 +518,7 @@ def render_phase(
                 rotation=(spec["pitch"], 0, spec["yaw"]),
                 resolution=spec["res"],
                 focal_length=spec["focal"],
-                fit_ratio=0.6,
+                fit_ratio=fit_ratio,
                 background=None,
             )
             written.append(master)
@@ -463,14 +531,33 @@ def render_phase(
                         bg,
                         spec["pitch"],
                         spec["yaw"],
-                        spec["hdri"],
+                        spec["env"],
                     ),
                 )
                 bpa.Renderer.add_bg_to_rgba(master, comp, color=bg)
                 written.append(comp)
 
-    assert scene_loaded
     return written
+
+
+def render_phase(
+    task: Dict,
+    layout: Dict,
+    scene_dir: str,
+    phase: str,
+    *,
+    env_strength: float = 1.0,
+    asset_dir: str = None,
+    hdri_dir: Optional[str] = None,
+    fit_ratio: float = DEFAULT_FIT_RATIO,
+) -> List[str]:
+    """Render every spec in a legacy *phase* (thin wrapper over render_specs)."""
+
+    return render_specs(
+        task, layout, scene_dir, enumerate_renders(phase),
+        env_strength=env_strength, asset_dir=asset_dir,
+        hdri_dir=hdri_dir, fit_ratio=fit_ratio,
+    )
 
 
 # ===========================================================================
@@ -485,12 +572,32 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--scene-dir", help="Directory containing both task JSON and layout.json"
     )
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--render",
+        action="store_true",
+        help="Render the single baseline image (512/white/50mm/pitch0/yaw0/city): "
+             "transparent master + white composite.",
+    )
+    mode.add_argument(
+        "--render-all",
+        action="store_true",
+        help="Render the six single-axis sweeps (resolution/focal/pitch/yaw/env/bg).",
+    )
     p.add_argument(
         "--phase",
         choices=cfg.PHASES + ["all"],
-        default="1a",
+        default=None,
+        help="Legacy single-phase render (building block). Mutually exclusive "
+             "with --render/--render-all.",
     )
     p.add_argument("--env-strength", type=float, default=1.0)
+    p.add_argument("--fit-ratio", type=float, default=DEFAULT_FIT_RATIO)
+    p.add_argument(
+        "--hdri-dir",
+        default=None,
+        help="Directory of .exr env maps (default: vendored vlmunr_hdri/).",
+    )
     p.add_argument(
         "--asset-dir",
         default="objaverse_processed",
@@ -519,16 +626,25 @@ def main(argv: Optional[List[str]] = None) -> None:
             if os.path.isdir(cand):
                 asset_dir = cand
 
-    phases = cfg.PHASES if args.phase == "all" else [args.phase]
-    all_written: List[str] = []
-    for ph in phases:
-        all_written.extend(
-            render_phase(
-                task, layout, scene_dir, ph,
-                env_strength=args.env_strength, asset_dir=asset_dir,
-            )
-        )
-    print(f"Wrote {len(all_written)} images to {scene_dir}/renderings")
+    if args.render:
+        specs = [cfg.single_render_spec()]
+    elif args.render_all:
+        specs = cfg.all_sweep_specs()
+    elif args.phase:
+        if args.phase == "all":
+            specs = [s for ph in cfg.PHASES for s in enumerate_renders(ph)]
+        else:
+            specs = enumerate_renders(args.phase)
+    else:
+        # Default to the single baseline render if nothing is specified.
+        specs = [cfg.single_render_spec()]
+
+    written = render_specs(
+        task, layout, scene_dir, specs,
+        env_strength=args.env_strength, asset_dir=asset_dir,
+        hdri_dir=args.hdri_dir, fit_ratio=args.fit_ratio,
+    )
+    print(f"Wrote {len(written)} images to {scene_dir}/renderings")
 
 
 if __name__ == "__main__":
