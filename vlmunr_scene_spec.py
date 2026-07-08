@@ -286,7 +286,7 @@ def resolve_asset_spec(
                 union = len(q | t) or 1
                 scored.append((inter / union, r))
             scored.sort(key=lambda x: -x[0])
-            pool = [r for _, r in scored if _[0] > 0]
+            pool = [r for score, r in scored if score > 0]
         if not pool:
             warnings.append(f"no asset found for {cat!r} ({desc!r})")
             continue

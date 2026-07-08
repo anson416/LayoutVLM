@@ -221,18 +221,29 @@ def _json_default(obj):
 
 def parse_args(argv: List[str] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Generate a LayoutVLM scene from a textual prompt.",
+        description="Generate a LayoutVLM scene from a textual prompt, "
+                    "or render scenes already written under a run folder.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    # --- the textual scene description ---
-    p.add_argument("--prompt", required=True,
-                   help="Textual scene description.")
+
+    # --- input mode: generate-from-prompt OR render-from-path (never both) ---
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--prompt",
+                     help="Textual scene description. Generates a fresh scene "
+                          "(+ variants with --variants) under a new "
+                          "outputs/<timestamp>/ folder.")
+    src.add_argument("--path",
+                     help="Path to an EXISTING run folder "
+                          "(outputs/<timestamp>/). No generation occurs; only "
+                          "the already-present scene folders (base/ and every "
+                          "variant_*) are rendered.")
 
     # --- LLM endpoint (resource #7) ---
     p.add_argument("--base_url", default="https://api.openai.com/v1",
                    help="OpenAI-compatible LLM base URL.")
     p.add_argument("--api_key", default=os.environ.get("OPENAI_API_KEY"),
-                   help="LLM API key (or set OPENAI_API_KEY).")
+                   help="LLM API key (or set OPENAI_API_KEY). Required for "
+                        "--prompt (real mode); ignored for --path.")
     p.add_argument("--model", default="gpt-4o",
                    help="LLM model name used for generation.")
     p.add_argument("--temperature", type=float, default=0.0,
@@ -244,22 +255,28 @@ def parse_args(argv: List[str] = None) -> argparse.Namespace:
                         "data.json (REQUIRED for real mode).")
     p.add_argument("--hdri_dir", default=os.path.join(ROOT, "vlmunr_hdri"),
                    help="Directory of .exr environment maps (vendored by "
-                        "default). Used only in real (non-mock) rendering.")
+                        "default). Used for --render / --render-all lighting.")
     p.add_argument("--asset_library", default=None,
                    help="JSON asset library for the worst-object variant "
                         "(list of {category,description,path[,assetMetadata]}).")
 
     # --- behavior flags ---
     p.add_argument("--variants", action="store_true",
-                   help="Also write the 4 named content variants.")
-    p.add_argument("--render", action="store_true",
-                   help="Render each scene (base + variants) into its own "
-                        "renderings/ sub-folder. Requires bpy + HDRIs; "
-                        "degrades gracefully (skips rendering, keeps the rest) "
-                        "if bpy is unavailable or an asset mesh is missing.")
-    p.add_argument("--render_phase", default="1a",
-                   help="Render phase (vlmunr_render/vlmunr_config). '1a' = one "
-                        "image per resolution at the baseline yaw/pitch/hdri.")
+                   help="Also write the 4 named content variants (--prompt "
+                        "mode only).")
+    # --- render mode: single image OR full sweep (never both) ---
+    render = p.add_mutually_exclusive_group()
+    render.add_argument("--render", action="store_true",
+                        help="Render each scene at the baseline point only: "
+                             "512px, 50mm, pitch 0 (top-down), yaw 0, 'city' "
+                             "env map, white (255,255,255) bg. Saves BOTH the "
+                             "transparent master and the white composite.")
+    render.add_argument("--render-all", action="store_true",
+                        help="Render each scene across six single-axis sweeps "
+                             "(resolution / focal / pitch / yaw / env / bg). "
+                             "See vlmunr_config.all_sweep_specs for the exact "
+                             "levels. Renders are best-effort: a failure for "
+                             "one scene is logged and the rest still render.")
     p.add_argument("--mock", action="store_true",
                    help="Skip the LLM + gradient solver; produce a random "
                         "placement layout so the pipeline + variants run "
@@ -267,7 +284,7 @@ def parse_args(argv: List[str] = None) -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42,
                    help="RNG seed for variant generation.")
     p.add_argument("--outputs_dir", default="./outputs",
-                   help="Root outputs directory.")
+                   help="Root outputs directory (--prompt mode only).")
     return p.parse_args(argv)
 
 
@@ -420,20 +437,34 @@ def _make_self_contained(
     return out_task
 
 
-def _maybe_render(
-    task: dict, layout: dict, scene_dir: str, args, reason: str
+def _render_specs_for(args) -> List[dict]:
+    """The render spec list selected by --render / --render-all.
+
+    Returns an empty list when neither flag is set (no rendering).
+    """
+
+    import vlmunr_config as _cfg
+    if args.render_all:
+        return _cfg.all_sweep_specs()
+    if args.render:
+        return [_cfg.single_render_spec()]
+    return []
+
+
+def _render_scene(
+    task: dict, layout: dict, scene_dir: str, args, specs: List[dict],
+    reason: str,
 ) -> List[str]:
-    """Render one scene into ``<scene_dir>/renderings/`` when ``--render``.
+    """Render one scene's specs into ``<scene_dir>/renderings/``.
 
     The renderings folder is ALWAYS named ``renderings`` (the vlmunr_render
     renderer writes there); it is only created when there are actually renders
-    to write.  Rendering is optional and best-effort: any failure (no bpy, a
-    missing mesh, an HDRI problem) is logged and skipped so the rest of the
-    pipeline still completes.  Returns the list of PNG paths written (empty
-    when not rendering or on failure).
+    to write.  Rendering is best-effort: any failure (no bpy, a missing mesh,
+    an HDRI problem) is logged and skipped so the rest of the pipeline still
+    completes.  Returns the list of PNG paths written (empty on failure).
     """
 
-    if not args.render:
+    if not specs:
         return []
     try:
         import vlmunr_render as _render  # noqa: WPS433 (lazy: pulls in bpy)
@@ -442,15 +473,15 @@ def _maybe_render(
               f"skipping rendering for {reason}.")
         return []
     try:
-        # resolve_asset paths inside the self-contained folder are relative
-        # ("./meshes/..."); the renderer resolves them against CWD, so chdir
-        # into the scene folder for the duration of the render.
+        # Self-contained scene folders store meshes at "./meshes/..."; the
+        # renderer resolves those against CWD, so chdir into the scene folder
+        # for the duration of the render.
         prev_cwd = os.getcwd()
         os.chdir(scene_dir)
         try:
-            written = _render.render_phase(
-                task, layout, scene_dir, args.render_phase,
-                env_strength=1.0, asset_dir=None,
+            written = _render.render_specs(
+                task, layout, scene_dir, specs,
+                env_strength=1.0, asset_dir=None, hdri_dir=args.hdri_dir,
             )
         finally:
             os.chdir(prev_cwd)
@@ -461,17 +492,102 @@ def _maybe_render(
         return []
 
 
+def _iter_scene_dirs(run_dir: str) -> List[str]:
+    """Return the scene folders to render under a run dir (in fixed order).
+
+    Always includes ``base`` first (if present), then every ``variant_*``
+    sub-folder sorted lexically.  Non-scene entries (config.json, solve_run/,
+    loose files) are ignored.
+    """
+
+    if not os.path.isdir(run_dir):
+        return []
+    scenes: List[str] = []
+    base = os.path.join(run_dir, "base")
+    if os.path.isdir(base):
+        scenes.append(base)
+    try:
+        names = sorted(n for n in os.listdir(run_dir) if n.startswith("variant_"))
+    except OSError:
+        names = []
+    for n in names:
+        d = os.path.join(run_dir, n)
+        if os.path.isdir(d):
+            scenes.append(d)
+    return scenes
+
+
+def _render_path_mode(args) -> int:
+    """``--path`` mode: render every already-present scene folder, no generation.
+
+    Each scene folder (base/ and every variant_*) carries its own task.json +
+    layout.json + meshes/, so it is rendered independently.  Rendering is the
+    whole point of this mode, so a missing bpy is a hard error (not graceful).
+    """
+
+    run_dir = os.path.abspath(args.path)
+    if not os.path.isdir(run_dir):
+        print(f"ERROR: --path {run_dir!r} is not a directory.", file=sys.stderr)
+        return 2
+    specs = _render_specs_for(args)
+    if not specs:
+        print("ERROR: --path requires --render or --render-all.",
+              file=sys.stderr)
+        return 2
+    scenes = _iter_scene_dirs(run_dir)
+    if not scenes:
+        print(f"ERROR: no scene folders (base/ or variant_*) found under "
+              f"{run_dir!r}.", file=sys.stderr)
+        return 3
+    # Hard-fail on missing bpy here: in --path mode there is nothing else to do.
+    try:
+        import vlmunr_render as _render  # noqa: F401
+    except Exception as exc:
+        print(f"ERROR: bpy/vlmunr_render unavailable ({exc}); cannot render.",
+              file=sys.stderr)
+        return 4
+
+    n_specs = len(specs)
+    print(f"rendering {len(scenes)} scene(s) from {run_dir} "
+          f"({'--render-all' if args.render_all else '--render'}, "
+          f"{n_specs} spec(s)).")
+    total = 0
+    for scene_dir in scenes:
+        name = os.path.basename(scene_dir)
+        try:
+            with open(os.path.join(scene_dir, "task.json")) as f:
+                task = json.load(f)
+            with open(os.path.join(scene_dir, "layout.json")) as f:
+                layout = json.load(f)
+        except FileNotFoundError as exc:
+            print(f"  - {name}: SKIP (missing {exc.filename})")
+            continue
+        written = _render_scene(task, layout, scene_dir, args, specs, name)
+        print(f"  - {name}: {len(written)} image(s) -> renderings/")
+        total += len(written)
+    print(f"\nDone. Rendered {total} image(s) across {len(scenes)} scene(s).")
+    return 0
+
+
 def main(argv: List[str] = None) -> int:
     args = parse_args(argv)
 
+    # --- --path mode: render already-present scenes, no generation ---
+    if args.path:
+        return _render_path_mode(args)
+
+    # --- --prompt mode: generate a fresh scene ---
     if not args.api_key:
-        print("ERROR: --api_key (or OPENAI_API_KEY) is required.",
+        print("ERROR: --api_key (or OPENAI_API_KEY) is required for --prompt.",
               file=sys.stderr)
         return 2
 
     # Surface missing-external-resource problems early.
     for w in _check_external_resources(args, mock=args.mock):
         print(f"  WARN: {w}")
+
+    # Resolve the render spec set once (--render / --render-all / none).
+    _specs = _render_specs_for(args)
 
     # --- run folder: outputs/<YYYYMMDD-HHMMSS> (UTC) ---
     # datetime.UTC exists on 3.11+; datetime.timezone.utc is the 3.10-compatible
@@ -503,6 +619,8 @@ def main(argv: List[str] = None) -> int:
         "variants": args.variants,
         "mock": args.mock,
         "seed": args.seed,
+        "render": args.render,
+        "render_all": args.render_all,
         "timestamp_utc": stamp,
     }
     with open(os.path.join(run_dir, "config.json"), "w") as f:
@@ -577,9 +695,9 @@ def main(argv: List[str] = None) -> int:
         task, layout, base_dir,
         scene_spec_dict=spec, solve_run_dir=solve_run_dir,
     )
-    _render_count = _maybe_render(base_task, layout, base_dir, args, "base")
-    if _render_count:
-        print(f"      rendered {len(_render_count)} image(s) -> base/renderings")
+    _rc = _render_scene(base_task, layout, base_dir, args, _specs, "base")
+    if _rc:
+        print(f"      rendered {len(_rc)} image(s) -> base/renderings")
 
     # --- 4. variants (Q2-Q5), no re-solve ---
     if args.variants:
@@ -596,7 +714,7 @@ def main(argv: List[str] = None) -> int:
             if v_intent is not None:
                 with open(os.path.join(v_dir, "variant_intent.json"), "w") as f:
                     json.dump(v_intent, f, indent=2, default=_json_default)
-            rc_imgs = _maybe_render(v_task, v_layout, v_dir, args, name)
+            rc_imgs = _render_scene(v_task, v_layout, v_dir, args, _specs, name)
             extra = (f"; rendered {len(rc_imgs)} image(s)"
                      if rc_imgs else "")
             print(f"      - {name}{extra}")
