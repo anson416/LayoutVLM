@@ -1,0 +1,84 @@
+[build-system]
+requires = ["setuptools >= 61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "layoutvlm"
+dynamic = ["version"]
+requires-python = ">=3.13,<3.14"
+description = "Differentiable optimization of 3D layout via vision-language models (text-to-scene CLI + audit rendering)"
+readme = "README.md"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Natural Language :: English",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Graphics :: 3D Modeling",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# ---------------------------------------------------------------------------
+# Core runtime dependencies.
+#
+# Versions are pinned to the validated "vlmunr" conda env (Python 3.13.14,
+# bpy 5.1.2). mathutils / bmesh / bpy_extras are NOT listed separately: they
+# ship INSIDE the bpy wheel and are only importable once `bpy` is imported.
+# langchain (the full meta-package) is intentionally NOT a dependency -- only
+# langchain-core + langchain-openai are used; the openai client is pulled in
+# transitively by langchain-openai (and listed explicitly here for clarity).
+# transformers / accelerate / requests / pyyaml / torchvision appear in the
+# legacy requirements.txt but are NOT imported anywhere in this repo, so they
+# are omitted.
+# ---------------------------------------------------------------------------
+dependencies = [
+    "bpy==5.1.2",
+    "numpy==2.5.0",
+    "scipy==1.18.0",
+    "torch==2.12.1",
+    "pydantic==2.13.4",
+    "shapely==2.1.2",
+    "imageio==2.37.3",
+    "trimesh==4.12.2",
+    "pillow==12.2.0",
+    "opencv-python==4.13.0.92",
+    "matplotlib==3.11.0",
+    "tqdm==4.68.3",
+    "openai==2.43.0",
+    "langchain-core==1.4.8",
+    "langchain-openai==1.3.3",
+]
+
+[project.optional-dependencies]
+# Test tooling (runs the pure-function + bpy-smoke suite under tests/).
+dev = ["pytest==9.1.1"]
+# Rotated-IoU oriented bounding-box overlap loss for the gradient solver.
+# OPTIONAL: src/layoutvlm/constraints.py falls back to a simpler overlap loss
+# (with a warning) when the CUDA extension is not built, so generation still
+# works without it. It is a local third_party/ with its own setup.py; build it
+# separately on a CUDA box:
+#     cd third_party/Rotated_IoU/cuda_op && python setup.py install
+cuda = []
+
+[project.scripts]
+# Expose the text->scene CLI as `layoutvlm` once installed.
+layoutvlm = "cli:main"
+
+[tool.setuptools]
+# Top-level single-file modules (root of the repo, not under a package dir).
+py-modules = [
+    "cli",
+    "main",
+    "vlmunr_bpa",
+    "vlmunr_config",
+    "vlmunr_render",
+    "vlmunr_scene_spec",
+    "vlmunr_shell",
+    "vlmunr_variants",
+]
+# Regular packages (carry __init__.py). utils/ is imported as a namespace
+# package (utils.placement_utils, ...) and is discovered via find below.
+packages = ["src", "src.layoutvlm", "prompts", "utils"]
+
+[tool.setuptools.dynamic]
+version = { attr = "src.layoutvlm.__version__" }
