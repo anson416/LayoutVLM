@@ -76,22 +76,22 @@ def make_synthetic_layout(n: int = 8):
 def test_master_filename_exact():
     assert (
         render.master_filename(512, 50, 0, 0, "city")
-        == "render_512_50_0_0_city.png"
+        == "render_res-512_focal-50_pitch-0_yaw-0_env-city.png"
     )
     assert (
         render.master_filename(1024, 200, 60, 330, "sunset")
-        == "render_1024_200_60_330_sunset.png"
+        == "render_res-1024_focal-200_pitch-60_yaw-330_env-sunset.png"
     )
 
 
 def test_composite_filename_exact():
     assert (
         render.composite_filename(512, 50, (128, 128, 128), 0, 0, "city")
-        == "render_512_50_128_128_128_0_0_city.png"
+        == "render_res-512_focal-50_pitch-0_yaw-0_env-city_bg-128-128-128.png"
     )
     assert (
         render.composite_filename(224, 24, (0, 0, 0), 90, 180, "studio")
-        == "render_224_24_0_0_0_90_180_studio.png"
+        == "render_res-224_focal-24_pitch-90_yaw-180_env-studio_bg-0-0-0.png"
     )
 
 
@@ -116,8 +116,9 @@ def test_factor_level_counts():
     assert len(cfg.FOCAL_LENGTHS) == 7
     assert len(cfg.PITCHES) == 7
     assert len(cfg.YAWS) == 8
-    assert len(cfg.BACKGROUND_GRAYS) == 6
+    assert len(cfg.BACKGROUND_GRAYS) == 7   # 0,65,118,128,186,204,255
     assert len(cfg.BACKGROUND_CHROMATIC) == 3
+    assert len(cfg.BACKGROUNDS) == 10       # grays + chromatic
 
 
 def test_factor_level_values_exact():
@@ -125,10 +126,72 @@ def test_factor_level_values_exact():
     assert cfg.FOCAL_LENGTHS == [16, 24, 35, 50, 85, 100, 200]
     assert cfg.PITCHES == [0, 15, 30, 45, 60, 75, 90]
     assert cfg.YAWS == [0, 45, 90, 135, 180, 225, 270, 315]
-    assert cfg.BACKGROUND_GRAYS == [0, 65, 128, 186, 204, 255]
+    assert cfg.BACKGROUND_GRAYS == [
+        (0, 0, 0), (65, 65, 65), (118, 118, 118), (128, 128, 128),
+        (186, 186, 186), (204, 204, 204), (255, 255, 255),
+    ]
     assert cfg.BACKGROUND_CHROMATIC == [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
+    assert cfg.BACKGROUNDS == cfg.BACKGROUND_GRAYS + cfg.BACKGROUND_CHROMATIC
     assert cfg.FLOOR_TEXTURE_BACKGROUND == "floor_texture"
-    assert cfg.BASELINE_YAW_PITCH == 45
+    # The single-axis sweeps fix the background at white.
+    assert cfg.BASELINE_BG == (255, 255, 255)
+    assert cfg.BASELINE_YAW_PITCH == 45   # yaw sweep uses pitch 45
+
+
+def test_single_render_spec():
+    s = cfg.single_render_spec()
+    assert s["res"] == 512
+    assert s["focal"] == 50
+    assert s["pitch"] == 0
+    assert s["yaw"] == 0
+    assert s["env"] == "city"
+    assert s["bgs"] == [(255, 255, 255)]   # white composite only
+
+
+def test_all_sweep_specs_axes():
+    specs = cfg.all_sweep_specs()
+    # 9 + 7 + 7 + 8 + 8 + 1 = 40 raw specs before per-master dedup.
+    assert len(specs) == 40
+    white = (255, 255, 255)
+    # Every non-bg sweep fixes the background at white.
+    non_bg = [s for s in specs if s["bgs"] == [white]]
+    assert len(non_bg) == 39
+    # The bg sweep carries all 10 backgrounds.
+    bg = [s for s in specs if len(s["bgs"]) > 1]
+    assert len(bg) == 1
+    assert set(bg[0]["bgs"]) == set(cfg.BACKGROUNDS)
+    # The yaw sweep uses pitch 45 (NOT baseline 0): the 8 yaw-sweep specs each
+    # sit at pitch 45, one per yaw level. (The pitch sweep also contributes one
+    # pitch-45 spec at yaw 0, so there are 9 specs at pitch 45 total -- 8 from
+    # the yaw sweep + 1 from the pitch sweep.)
+    p45 = [s for s in specs if s["pitch"] == 45]
+    assert len(p45) == 9
+    assert set(s["yaw"] for s in p45) == set(cfg.YAWS)
+    # The non-baseline-pitch specs in the pitch sweep itself prove the yaw
+    # sweep is the only place pitch 45 pairs with non-zero yaw.
+    assert all(s["yaw"] == 0 for s in p45 if s not in
+               [x for x in p45 if x["yaw"] != 0])
+    # Every non-bg sweep fixes the background at white.
+    assert all(s["bgs"] == [white] for s in non_bg)
+
+
+def test_merge_specs_dedups_shared_master():
+    # The baseline master (512/50/0/0/city) appears in the res, focal, pitch,
+    # env and bg sweeps -> it must be merged into ONE master whose bgs are the
+    # union (all 10, since the bg sweep contributes them).
+    merged = render.merge_specs(cfg.all_sweep_specs())
+    # 35 unique masters: 9 + 7 + 6 + 8 + 7 + 1 - shared-baseline overlaps.
+    assert len(merged) == 35
+    baseline = [s for s in merged if (s["res"], s["focal"], s["pitch"],
+                                      s["yaw"], s["env"]) == (512, 50, 0, 0, "city")]
+    assert len(baseline) == 1
+    # Union == all 10 (order is first-seen, so compare as a set).
+    assert set(baseline[0]["bgs"]) == set(cfg.BACKGROUNDS)
+    # A non-shared master (e.g. res 196) only appears in the res sweep with
+    # the single white bg.
+    r196 = [s for s in merged if s["res"] == 196]
+    assert len(r196) == 1
+    assert r196[0]["bgs"] == [(255, 255, 255)]
 
 
 def test_phase_1b_chroma():
@@ -750,6 +813,75 @@ def test_cli_missing_api_key_errors(tmp_path):
         if key is not None:
             os.environ["OPENAI_API_KEY"] = key
     assert rc == 2
+
+
+def test_cli_prompt_and_path_are_mutually_exclusive(tmp_path):
+    import cli
+    # argparse rejects --prompt + --path with SystemExit(2).
+    with pytest.raises(SystemExit):
+        cli.main(["--prompt", "x", "--path", str(tmp_path),
+                  "--api_key", "sk-test1234567890"])
+
+
+def test_cli_render_and_render_all_are_mutually_exclusive(tmp_path):
+    import cli
+    with pytest.raises(SystemExit):
+        cli.main(["--prompt", "x", "--render", "--render-all",
+                  "--api_key", "sk-test1234567890"])
+
+
+def test_cli_path_requires_render_flag(tmp_path):
+    """--path without --render/--render-all is a usage error (rc 2)."""
+    import cli
+    run = tmp_path / "run"
+    (run / "base").mkdir(parents=True)
+    (run / "base" / "layout.json").write_text("{}")
+    (run / "base" / "task.json").write_text("{}")
+    rc = cli.main(["--path", str(run)])
+    assert rc == 2
+
+
+def test_cli_path_missing_dir_errors(tmp_path):
+    import cli
+    rc = cli.main(["--path", str(tmp_path / "nope"), "--render",
+                   "--api_key", "sk-test1234567890"])
+    assert rc == 2
+
+
+def test_cli_render_specs_for_selects_spec():
+    """The spec-set selector maps --render/--render-all to the right specs."""
+    import cli
+    import argparse
+
+    def _args(**kw):
+        ns = argparse.Namespace(render=False, render_all=False)
+        for k, v in kw.items():
+            setattr(ns, k, v)
+        return ns
+
+    # no render flag -> no specs
+    assert cli._render_specs_for(_args()) == []
+    # --render -> exactly the single baseline spec
+    single = cli._render_specs_for(_args(render=True))
+    assert len(single) == 1
+    assert single[0]["res"] == 512 and single[0]["env"] == "city"
+    # --render-all -> the 40 raw sweep specs
+    all_specs = cli._render_specs_for(_args(render_all=True))
+    assert len(all_specs) == 40
+
+
+def test_cli_iter_scene_dirs_orders_base_then_variants(tmp_path):
+    import cli
+    run = tmp_path / "run"
+    (run / "base").mkdir(parents=True)
+    (run / "variant_03_scrambled").mkdir()
+    (run / "variant_01_half").mkdir()
+    (run / "config.json").write_text("{}")  # ignored
+    (run / "solve_run").mkdir()             # ignored (not a scene folder)
+    scenes = cli._iter_scene_dirs(str(run))
+    names = [os.path.basename(s) for s in scenes]
+    assert names == ["base", "variant_01_half", "variant_03_scrambled"]
+
 
 
 # ===========================================================================
