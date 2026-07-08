@@ -119,11 +119,26 @@ SUMMARY OF CLI ARGS MAPPING TO THE ABOVE
   --asset_library  -> resource #4 (optional; for variant_04)
   --base_url/--api_key/--model/--temperature -> resource #7 (LLM)
   --mock           -> skip #1/#5/#6/#7 entirely (offline demo)
-  --variants       -> also write the 4 named content variants
+  --variants       -> also write the 4 named content variants (--prompt only)
 
 ==============================================================================
 USAGE
 ==============================================================================
+
+INPUT MODES (mutually exclusive; exactly one required):
+  --prompt TEXT   generate a fresh scene (+ variants with --variants) into a
+                  new outputs/<timestamp>/ folder
+  --path DIR      render the scene folders (base/ + variant_*) ALREADY present
+                  under DIR; no generation occurs. Every scene folder is
+                  self-contained (meshes copied in, paths rewritten to
+                  ./meshes/...), so it renders without --asset_dir.
+
+RENDER MODES (mutually exclusive; optional; combine with either input mode):
+  --render        single baseline image: 512px / 50mm / pitch 0 (top-down) /
+                  yaw 0 / city env / white (255,255,255) bg. Saves BOTH the
+                  transparent master and the white composite.
+  --render-all    six single-axis sweeps: resolution / focal / pitch /
+                  yaw(at pitch 45) / env / background. See vlmunr_config.
 
 Real generation (needs processed Objaverse assets + an LLM endpoint + bpy):
 
@@ -135,12 +150,16 @@ Real generation (needs processed Objaverse assets + an LLM endpoint + bpy):
         --temperature 0.0 \
         --asset_dir ./objaverse_processed \
         --hdri_dir ./vlmunr_hdri \
-        --variants
+        --variants --render-all
 
-Offline demonstration (no LLM / no solver / no bpy; uses placeholder assets):
+Offline demonstration (no LLM / no solver; uses placeholder assets):
 
     python cli.py --prompt "a cozy bedroom" --api_key sk-dummy \
         --mock --variants --asset_dir ./tests/_synthetic_assets
+
+Re-render an already-generated run at the baseline point (no generation):
+
+    python cli.py --path outputs/20260708-131722 --render
 
 OUTPUT
 ------
@@ -154,7 +173,7 @@ Everything is written under outputs/<YYYYMMDD-HHMMSS UTC>/:
       meshes/                 the GLB meshes referenced by the scene, copied in
                               so the folder is self-contained (no external
                               asset_dir needed to view/render it)
-      renderings/             (only with --render) PNG renders of this scene
+      renderings/             (only with --render / --render-all) PNG renders
       solve_run/              (real mode only) per-group solver artifacts
   variant_01_half/            keep round(n/2) instances (seeded)
   variant_02_biggest-only/    keep the single largest instance (bbox volume)
@@ -163,14 +182,27 @@ Everything is written under outputs/<YYYYMMDD-HHMMSS UTC>/:
                               (only when --asset_library is given)
 
 Each variant directory has the SAME internal structure as base/ (task.json,
-layout.json, meshes/, and renderings/ when --render is set), so every scene --
-base or variant -- is independently renderable and portable. None of the
-variants re-run the LLM or the gradient solver; they fork the base layout.
+layout.json, meshes/, and renderings/ when a render flag is set), so every
+scene -- base or variant -- is independently renderable and portable. None of
+the variants re-run the LLM or the gradient solver; they fork the base layout.
 
 The renderings sub-folder is ALWAYS named "renderings" (the renderer writes
 there); it is only created when there are actually renders to write (i.e. when
---render is passed and bpy is available), so an absent renderings/ folder means
-"not rendered", never an error.
+--render / --render-all is passed and bpy is available), so an absent
+renderings/ folder means "not rendered", never an error.
+
+Render filenames (per the bpa convention: transparent master rendered once per
+(res,focal,pitch,yaw,env), then each bg composited onto it; fit_ratio=1):
+
+  render_res-<res>_focal-<focal>_pitch-<pitch>_yaw-<yaw>_env-<env>.png
+  render_res-<res>_focal-<focal>_pitch-<pitch>_yaw-<yaw>_env-<env>_bg-<r>-<g>-<b>.png
+
+pitch is the literal bpa pitch (0 = top-down). The architectural shell (floor +
+walls) is retained and rendered dollhouse-style: camera-facing walls are made
+transparent (back-face culling) so the camera always sees into the room while
+far walls stay visible. LayoutVLM specs carry only a floor footprint + wall
+height, so there is no door/window opening geometry; the shell is neutral
+floor+walls.
 """
 
 from __future__ import annotations
