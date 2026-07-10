@@ -3,7 +3,7 @@
 benchmark_tasks/
 results/
 objaverse_processed/
-outputs/
+outputs*/
 test_asset_dir/
 tests/_synthetic_assets/
 tests/_synthetic_lib.json
