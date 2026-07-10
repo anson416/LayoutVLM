@@ -527,12 +527,16 @@ def _render_scene(
     try:
         # Self-contained scene folders store meshes at "./meshes/..."; the
         # renderer resolves those against CWD, so chdir into the scene folder
-        # for the duration of the render.
+        # for the duration of the render. scene_dir is made absolute first:
+        # render_specs builds "<scene_dir>/renderings" from it, so a relative
+        # scene_dir would be re-joined against the chdir'd cwd and the
+        # renderings would land in a doubled path (.../base/outputs/.../base/).
+        abs_scene_dir = os.path.abspath(scene_dir)
         prev_cwd = os.getcwd()
-        os.chdir(scene_dir)
+        os.chdir(abs_scene_dir)
         try:
             written = _render.render_specs(
-                task, layout, scene_dir, specs,
+                task, layout, abs_scene_dir, specs,
                 env_strength=1.0, asset_dir=None, hdri_dir=args.hdri_dir,
             )
         finally:
