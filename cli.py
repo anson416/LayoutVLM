@@ -74,18 +74,26 @@ vendored in this repo (except the HDRIs). The full list:
 4. ASSET LIBRARY (for the worst-object variant)  -- OPTIONAL
    ----------------------------------------------------------------
    variant_04_worst-object swaps each placed instance's asset identity to the
-   WORST-matching candidate from a JSON asset library. Pass it with
-   --asset_library. Schema (a JSON list):
+   WORST-matching candidate from a pool of assets. Two ways to supply it:
 
-       [
-         {"category": "rock", "description": "a heavy boulder",
-          "path": "/abs/path/to/boulder.glb",
-          "assetMetadata": {"boundingBox": {"x": 2,"y": 2,"z": 2}}},
-         ...
-       ]
+     a. Explicitly with --asset_library: a JSON list of records:
+          [
+            {"category": "rock", "description": "a heavy boulder",
+             "path": "/abs/path/to/boulder.glb",
+             "assetMetadata": {"boundingBox": {"x": 2,"y": 2,"z": 2}}},
+            ...
+          ]
+     b. Implicitly: omit --asset_library and the candidates are derived from
+        --asset_dir itself (resource #1). The processed Objaverse dir IS an
+        asset library -- each <uid>/data.json + <uid>.glb pair is exactly the
+        candidate-record schema, just spread across files -- so the variant
+        runs with no extra files. (An instance's own asset is never picked
+        back: it is a near-perfect text match, so it ranks last in the
+        worst-first ordering at rank_offset=0.)
 
-   If you omit --asset_library, that one variant is skipped (with a recorded
-   reason); the other three variants still run.
+   Only when BOTH --asset_library is absent AND --asset_dir has no usable
+   <uid>/data.json entries is that one variant skipped (with a recorded
+   reason); the other three variants always run.
 
 5. BLENDER (bpy)  -- REQUIRED for real rendering; a Python dependency
    ----------------------------------------------------------------
@@ -116,7 +124,8 @@ SUMMARY OF CLI ARGS MAPPING TO THE ABOVE
 ------------------------------------------------------------------------------
   --asset_dir      -> resource #1 (REQUIRED for real mode)
   --hdri_dir       -> resource #2 (default ./vlmunr_hdri, vendored)
-  --asset_library  -> resource #4 (optional; for variant_04)
+  --asset_library  -> resource #4 (optional; for variant_04; else derived
+                       from --asset_dir)
   --base_url/--api_key/--model/--temperature -> resource #7 (LLM)
   --mock           -> skip #1/#5/#6/#7 entirely (offline demo)
   --variants       -> also write the 4 named content variants (--prompt only)
@@ -178,8 +187,10 @@ Everything is written under outputs/<YYYYMMDD-HHMMSS UTC>/:
   variant_01_half/            keep round(n/2) instances (seeded)
   variant_02_biggest-only/    keep the single largest instance (bbox volume)
   variant_03_scrambled/       relocate every instance within the floor polygon
-  variant_04_worst-object/    swap asset identity to worst-match library cand
-                              (only when --asset_library is given)
+  variant_04_worst-object/    swap asset identity to worst-match candidate
+                              (candidates from --asset_library, else derived
+                              from --asset_dir; skipped only if neither has
+                              usable <uid>/data.json entries)
 
 Each variant directory has the SAME internal structure as base/ (task.json,
 layout.json, meshes/, and renderings/ when a render flag is set), so every
@@ -352,6 +363,7 @@ def _check_external_resources(args, *, mock: bool) -> List[str]:
     warnings = []
     if mock:
         return warnings
+    asset_dir_has_data = False
     if not os.path.isdir(args.asset_dir):
         warnings.append(
             f"--asset_dir {args.asset_dir!r} does not exist; real generation "
@@ -359,13 +371,16 @@ def _check_external_resources(args, *, mock: bool) -> List[str]:
         )
     else:
         # Spot-check that at least one data.json is present so the failure is
-        # surfaced early instead of after the LLM spec call.
+        # surfaced early instead of after the LLM spec call.  The result is also
+        # reused below to decide whether variant_04 can derive its candidates
+        # from the asset dir.
         sample = next(
             (os.path.join(args.asset_dir, n, "data.json")
              for n in os.listdir(args.asset_dir)
              if os.path.exists(os.path.join(args.asset_dir, n, "data.json"))),
             None,
         )
+        asset_dir_has_data = sample is not None
         if sample is None:
             warnings.append(
                 f"--asset_dir {args.asset_dir!r} has no <uid>/data.json entries; "
@@ -376,10 +391,15 @@ def _check_external_resources(args, *, mock: bool) -> List[str]:
             f"--hdri_dir {args.hdri_dir!r} does not exist; in-loop rendering "
             "will fail to light the scene."
         )
-    if args.variants and not args.asset_library:
+    if args.variants and not args.asset_library and not asset_dir_has_data:
+        # variant_04_worst-object derives its candidate pool from --asset_dir
+        # when --asset_library is absent, so it is only actually skipped when
+        # neither source can supply candidates.
         warnings.append(
-            "--variants set without --asset_library: variant_04_worst-object "
-            "will be skipped (the other three variants still run)."
+            "--variants set but variant_04_worst-object has no candidate "
+            "source: pass --asset_library, or point --asset_dir at a processed "
+            "Objaverse dir with <uid>/data.json entries (the other three "
+            "variants still run)."
         )
     return warnings
 
@@ -739,6 +759,7 @@ def main(argv: List[str] = None) -> int:
             task, layout,
             seed=args.seed,
             asset_library_path=args.asset_library,
+            asset_dir=args.asset_dir,
         )
         for name, v_task, v_layout, v_intent in var_layouts:
             v_dir = os.path.join(run_dir, name)

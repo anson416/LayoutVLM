@@ -159,11 +159,82 @@ def make_biggest_only_layout(
     return {kept: layout[kept]}, kept
 
 
+def build_asset_library_from_dir(asset_dir: str) -> List[Dict]:
+    """Build a worst-object candidate list by scanning a processed-asset dir.
+
+    The processed Objaverse dir layout (the same one ``prepare_task_assets`` in
+    ``main.py`` reads) IS an asset library -- the candidate-record schema is just
+    spread across files instead of serialized into one JSON list::
+
+        <asset_dir>/<uid>/data.json   -> {"annotations":{"category","description"},
+                                          "assetMetadata":{"boundingBox":{"x","y","z"}}}
+        <asset_dir>/<uid>/<uid>.glb   -> the mesh ("path")
+
+    This reconstructs the flat list ``make_worst_object_layout`` consumes:
+
+        {"category","description","path",
+         "assetMetadata":{"boundingBox":{"x","y","z"}}}
+
+    The bounding-box **x/y are swapped** to match the convention
+    ``prepare_task_assets`` writes into the prepared task (main.py: the prepared
+    bbox stores raw ``y`` under ``x`` and raw ``x`` under ``y``), so a candidate's
+    bbox compares like-for-like against the instance's.  Malformed or partial
+    entries (missing ``data.json``, unreadable JSON, missing category) are skipped
+    with a warning (mirroring ``prepare_task_assets``); returns ``[]`` for a
+    missing/empty dir so the caller degrades gracefully.
+    """
+
+    if not asset_dir or not os.path.isdir(asset_dir):
+        return []
+    candidates: List[Dict] = []
+    try:
+        entries = sorted(os.listdir(asset_dir))
+    except OSError:
+        return []
+    for uid in entries:
+        uid_dir = os.path.join(asset_dir, uid)
+        data_path = os.path.join(uid_dir, "data.json")
+        glb_path = os.path.join(uid_dir, f"{uid}.glb")
+        if not (os.path.isdir(uid_dir) and os.path.isfile(data_path)
+                and os.path.isfile(glb_path)):
+            continue
+        try:
+            with open(data_path) as f:
+                data = json.load(f)
+        except Exception as exc:
+            print(f"WARN: could not read {data_path!r} ({exc}); skipping")
+            continue
+        ann = data.get("annotations", {}) or {}
+        category = ann.get("category")
+        description = ann.get("description")
+        if not category or not description:
+            continue
+        raw_bbox = (
+            (data.get("assetMetadata", {}) or {}).get("boundingBox") or {}
+        )
+        try:
+            bbox = {
+                "x": float(raw_bbox.get("y", 0.0) or 0.0),  # swap, see docstring
+                "y": float(raw_bbox.get("x", 0.0) or 0.0),
+                "z": float(raw_bbox.get("z", 0.0) or 0.0),
+            }
+        except (TypeError, ValueError):
+            bbox = {"x": 0.0, "y": 0.0, "z": 0.0}
+        candidates.append({
+            "category": category,
+            "description": description,
+            "path": glb_path,
+            "assetMetadata": {"boundingBox": bbox},
+        })
+    return candidates
+
+
 def make_worst_object_layout(
     task: Dict,
     layout: Dict,
-    asset_library_path: str,
+    asset_library_path: Optional[str] = None,
     rank_offset: int = 0,
+    asset_dir: Optional[str] = None,
 ) -> Tuple[Dict, Dict, Dict]:
     """Fork a generated scene and substitute every instance's asset identity
     with the *worst-matching* candidate from an asset library.
@@ -177,11 +248,22 @@ def make_worst_object_layout(
     (``rank_offset == 0`` => single worst match; higher offsets move toward
     better matches).
 
-    Requires ``asset_library_path`` to point at a JSON list of records of the
-    form ``{"category","description","path"[,"assetMetadata":{"boundingBox":...}]}``.
-    Raises ``FileNotFoundError`` when the library is missing -- this variant
-    is meaningless without candidates, so (per the "real paths, no fallback"
-    contract) we fail loudly rather than degrade silently.
+    Candidates are resolved in order, so ``--asset_library`` stays optional:
+
+      * ``asset_library_path`` (a JSON list of records of the form
+        ``{"category","description","path"[,"assetMetadata":{"boundingBox":...}]}``)
+        when given;
+      * else ``asset_dir`` -- a processed Objaverse dir, scanned by
+        :func:`build_asset_library_from_dir` (the processed asset dir IS an asset
+        library, just spread across ``<uid>/data.json`` + ``<uid>.glb`` files).
+        Self-substitution is naturally avoided: an instance's own asset text is a
+        near-perfect lexical match, so it ranks last in the worst-first ordering
+        and is never picked at ``rank_offset == 0``.
+
+    Raises ``FileNotFoundError`` only when neither source yields candidates --
+    this variant is meaningless without them, so (per the "real paths, no
+    fallback" contract) we fail loudly rather than degrade silently.  An empty
+    but resolvable source degrades gracefully (recorded reason, scene unchanged).
 
     Returns ``(new_layout, new_task, intent)``.
     """
@@ -189,40 +271,57 @@ def make_worst_object_layout(
     intent: Dict = {
         "kind": "worst_object",
         "rank_offset": rank_offset,
-        "asset_library": asset_library_path,
+        "asset_library": asset_library_path or asset_dir,
         "substitutions": [],
         "degraded": False,
         "reason": "",
     }
 
-    if not os.path.exists(asset_library_path):
-        raise FileNotFoundError(
-            f"asset library not found: {asset_library_path!r} (required for "
-            "the worst-object variant; pass --asset_library)"
-        )
-    try:
-        with open(asset_library_path) as f:
-            candidates = json.load(f)
-    except Exception as exc:
-        raise ValueError(f"could not parse asset library {asset_library_path!r}: {exc}") from exc
-    # The library schema is a JSON *list* of records.  Be defensive: a single
-    # record written as a bare object, or a ``{"assets": [...]}`` wrapper, is
-    # coerced to the list form rather than crashing the variant step.
-    if isinstance(candidates, dict):
-        if isinstance(candidates.get("assets"), list):
-            candidates = candidates["assets"]
-        else:
-            candidates = [candidates]
-    if not isinstance(candidates, list):
-        raise ValueError(
-            f"asset library {asset_library_path!r} must be a JSON list of "
-            "records, not a " + type(candidates).__name__
-        )
-    # Drop anything that isn't a record dict so _text_for_asset can't crash.
-    candidates = [c for c in candidates if isinstance(c, dict)]
+    candidates: Optional[List[Dict]] = None
+    if asset_library_path:
+        if not os.path.exists(asset_library_path):
+            raise FileNotFoundError(
+                f"asset library not found: {asset_library_path!r} (required for "
+                "the worst-object variant; pass --asset_library)"
+            )
+        try:
+            with open(asset_library_path) as f:
+                candidates = json.load(f)
+        except Exception as exc:
+            raise ValueError(
+                f"could not parse asset library {asset_library_path!r}: {exc}"
+            ) from exc
+        # The library schema is a JSON *list* of records.  Be defensive: a single
+        # record written as a bare object, or a ``{"assets": [...]}`` wrapper, is
+        # coerced to the list form rather than crashing the variant step.
+        if isinstance(candidates, dict):
+            if isinstance(candidates.get("assets"), list):
+                candidates = candidates["assets"]
+            else:
+                candidates = [candidates]
+        if not isinstance(candidates, list):
+            raise ValueError(
+                f"asset library {asset_library_path!r} must be a JSON list of "
+                "records, not a " + type(candidates).__name__
+            )
+        # Drop anything that isn't a record dict so _text_for_asset can't crash.
+        candidates = [c for c in candidates if isinstance(c, dict)]
+    elif asset_dir:
+        candidates = build_asset_library_from_dir(asset_dir)
+
     if not candidates:
+        if candidates is None:
+            # Neither a library path nor an asset dir was supplied.
+            raise FileNotFoundError(
+                "no asset source for the worst-object variant: pass "
+                "--asset_library (a JSON list) or --asset_dir (a processed "
+                "Objaverse dir whose <uid>/data.json records provide candidates)"
+            )
         intent["degraded"] = True
-        intent["reason"] = "asset library is empty; scene left unchanged"
+        intent["reason"] = (
+            f"asset source ({intent['asset_library']!r}) yielded no candidates; "
+            "scene left unchanged"
+        )
         return dict(layout), dict(task), intent
 
     cand_texts = [_text_for_asset(c) for c in candidates]
@@ -752,6 +851,7 @@ def generate_named_variants(
     layout: Dict,
     seed: int = 42,
     asset_library_path: Optional[str] = None,
+    asset_dir: Optional[str] = None,
 ) -> List[str]:
     """Write the four named content variants as sub-dirs of ``run_dir``.
 
@@ -761,13 +861,17 @@ def generate_named_variants(
     * ``variant_04_worst-object``-- swap each instance's asset identity to the
       worst-matching library candidate (placements preserved; no re-solve).
 
-    ``variant_04_worst-object`` requires ``asset_library_path``; if it is
-    ``None`` that variant is skipped with a recorded reason rather than
-    aborting the other three.  Pass a real library path to get all four.
+    ``variant_04_worst-object`` resolves candidates from ``asset_library_path``
+    if given, else from ``asset_dir`` (a processed Objaverse dir -- see
+    :func:`build_asset_library_from_dir`).  If neither yields candidates the
+    variant is emitted with the original layout/task and a recorded reason
+    rather than aborting the other three.  So ``--asset_library`` is optional:
+    the processed ``--asset_dir`` already provides candidates.
     """
 
     built = build_named_variants(
-        task, layout, seed=seed, asset_library_path=asset_library_path
+        task, layout, seed=seed, asset_library_path=asset_library_path,
+        asset_dir=asset_dir,
     )
     written: List[str] = []
     for name, v_task, v_layout, v_intent in built:
@@ -789,6 +893,7 @@ def build_named_variants(
     layout: Dict,
     seed: int = 42,
     asset_library_path: Optional[str] = None,
+    asset_dir: Optional[str] = None,
 ) -> List[Tuple[str, Dict, Dict, Optional[Dict]]]:
     """Build the four named variants *in memory* (no disk writes).
 
@@ -801,12 +906,16 @@ def build_named_variants(
     worst-object variant deep-copies and swaps asset identities; the others
     reuse the input task).  ``new_layout`` is the forked layout (placements
     only; never re-solved).  ``intent`` records what the variant did (or, for
-    the worst-object variant without a library, why it was degraded).
+    the worst-object variant without a usable asset source, why it was
+    degraded).
 
-    ``variant_04_worst-object`` requires ``asset_library_path``; without it,
-    that variant is emitted with the *original* layout/task and a degraded
-    intent (rather than raising), so callers can still persist a folder with
-    an explanatory ``variant_intent.json``.
+    ``variant_04_worst-object`` resolves candidates from ``asset_library_path``
+    if given, else from ``asset_dir`` (a processed Objaverse dir whose
+    ``<uid>/data.json`` records provide candidates -- see
+    :func:`build_asset_library_from_dir`).  Without either, that variant is
+    emitted with the *original* layout/task and a degraded intent (rather than
+    raising), so callers can still persist a folder with an explanatory
+    ``variant_intent.json``.
     """
 
     built: List[Tuple[str, Dict, Dict, Optional[Dict]]] = []
@@ -829,10 +938,12 @@ def build_named_variants(
     scrambled = scramble_layout(layout, floor_vertices, seed)
     built.append((NAMED_VARIANT_SCRAMBLE, task, scrambled, None))
 
-    # 04 -- worst-object fork (requires an asset library)
-    if asset_library_path:
+    # 04 -- worst-object fork: prefer an explicit library, else derive
+    # candidates from the processed asset dir (which IS an asset library).
+    if asset_library_path or asset_dir:
         new_layout, new_task, intent = make_worst_object_layout(
-            task, layout, asset_library_path, rank_offset=0
+            task, layout, asset_library_path, rank_offset=0,
+            asset_dir=asset_dir,
         )
         built.append((NAMED_VARIANT_WORST, new_task, new_layout, intent))
     else:
@@ -842,8 +953,8 @@ def build_named_variants(
             "kind": "worst_object",
             "degraded": True,
             "reason": (
-                "no --asset_library provided; worst-object variant requires "
-                "a real asset library (no synthetic fallback)"
+                "no --asset_library or --asset_dir provided; the worst-object "
+                "variant needs candidate assets (no synthetic fallback)"
             ),
         }
         built.append((NAMED_VARIANT_WORST, task, layout, intent))

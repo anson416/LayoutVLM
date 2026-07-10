@@ -473,6 +473,62 @@ def test_worst_object_missing_library_raises(tmp_path):
         variants.make_worst_object_layout(task, layout, str(tmp_path / "nope.json"))
 
 
+def test_worst_object_derives_from_asset_dir(tmp_path):
+    """With no --asset_library, candidates are derived from --asset_dir.
+
+    The processed Objaverse dir IS an asset library (each <uid>/data.json +
+    <uid>.glb pair is the candidate-record schema), so the worst-object variant
+    runs with no extra file.  An instance's own asset is never re-picked (it is
+    a near-perfect text match -> ranks last in the worst-first ordering).
+    """
+    asset_dir = _make_synthetic_asset_dir(tmp_path, [
+        ("bed", "a queen bed"), ("chair", "a rattan chair"),
+        ("table", "a small table"), ("lamp", "a floor lamp"),
+    ])
+    # Two instances whose own assets live in this asset_dir.
+    task = make_synthetic_task(0)
+    task["assets"]["uid00-0"] = {
+        "path": str(asset_dir / "uid00" / "uid00.glb"),
+        "category": "bed", "description": "a queen bed", "onFloor": True,
+        "uid": "uid00",
+        "assetMetadata": {"boundingBox": {"x": 1.0, "y": 1.0, "z": 0.4}},
+    }
+    task["assets"]["uid01-0"] = {
+        "path": str(asset_dir / "uid01" / "uid01.glb"),
+        "category": "chair", "description": "a rattan chair", "onFloor": True,
+        "uid": "uid01",
+        "assetMetadata": {"boundingBox": {"x": 1.0, "y": 1.0, "z": 0.4}},
+    }
+    layout = make_synthetic_layout(0)
+    layout["uid00-0"] = {"position": [0.0, 0.0, 0.0], "rotation": [0, 0, 0]}
+    layout["uid01-0"] = {"position": [1.0, 1.0, 0.0], "rotation": [0, 0, 0]}
+
+    new_layout, new_task, intent = variants.make_worst_object_layout(
+        task, layout, asset_dir=str(asset_dir), rank_offset=0
+    )
+    # placements preserved
+    assert new_layout == layout
+    assert intent["kind"] == "worst_object"
+    assert not intent["degraded"]
+    assert intent["asset_library"] == str(asset_dir)
+    assert len(intent["substitutions"]) == 2
+    # every instance's asset identity moved off its own mesh
+    for inst_id in layout:
+        orig_path = task["assets"][inst_id]["path"]
+        new_path = new_task["assets"][inst_id]["path"]
+        assert new_path != orig_path
+        # the chosen candidate is a real asset_dir mesh, distinct from itself
+        assert new_path.startswith(str(asset_dir))
+
+
+def test_worst_object_no_source_raises():
+    """Neither an asset library nor an asset dir -> FileNotFoundError."""
+    task = make_synthetic_task(2)
+    layout = make_synthetic_layout(2)
+    with pytest.raises(FileNotFoundError):
+        variants.make_worst_object_layout(task, layout)  # no path, no dir
+
+
 def test_generate_named_variants_writes_four(tmp_path):
     task = make_synthetic_task(6)
     layout = make_synthetic_layout(6)
@@ -797,6 +853,44 @@ def test_cli_mock_mode_end_to_end(tmp_path):
         for p in worst_meshes
     ]
     assert "boulder-mesh-bytes" in copied
+
+
+def test_cli_mock_worst_object_without_asset_library(tmp_path):
+    """variant_04 runs with NO --asset_library: candidates come from --asset_dir."""
+    import cli
+
+    asset_dir = _make_synthetic_asset_dir(tmp_path, [
+        ("bed", "a queen bed"), ("chair", "a rattan chair"),
+        ("table", "a small table"), ("lamp", "a floor lamp"),
+    ])
+    out_root = tmp_path / "outputs"
+    rc = cli.main([
+        "--prompt", "a cozy bedroom with a bed and a chair",
+        "--api_key", "sk-test1234567890",
+        "--mock", "--variants",
+        "--asset_dir", str(asset_dir),
+        # NOTE: no --asset_library
+        "--outputs_dir", str(out_root),
+    ])
+    assert rc == 0
+
+    run = out_root / sorted(os.listdir(out_root))[0]
+    worst = run / "variant_04_worst-object"
+    assert worst.is_dir()
+    assert (worst / "task.json").exists()
+    assert (worst / "variant_intent.json").exists()
+
+    # non-degraded: the variant actually swapped identities.
+    intent = json.load(open(worst / "variant_intent.json"))
+    assert intent["degraded"] is False
+    assert intent["asset_library"] == str(asset_dir)
+
+    # swapped asset paths were copied into the variant's self-contained meshes/
+    worst_task = json.load(open(worst / "task.json"))
+    for ent in worst_task["assets"].values():
+        if ent.get("path"):
+            assert ent["path"].startswith("./meshes/")
+    assert any(p.endswith(".glb") for p in os.listdir(worst / "meshes"))
 
 
 def test_cli_missing_api_key_errors(tmp_path):
